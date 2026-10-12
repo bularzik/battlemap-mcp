@@ -16,11 +16,10 @@ import sysconfig
 import tarfile
 import tempfile
 import threading
+import tomllib
 import venv
 import zipfile
 from pathlib import Path
-
-import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 MOD_FILES = (

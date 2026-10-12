@@ -1,0 +1,4 @@
+# The release tooling runs on Python 3.11+ (tomllib). Without a target, ruff
+# 0.16 filed tomllib as third-party and 0.17 as standard library, so the
+# same import order passed locally and failed CI for the v1.3.0 tag.
+target-version = "py311"
