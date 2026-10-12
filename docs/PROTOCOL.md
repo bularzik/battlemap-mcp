@@ -135,6 +135,9 @@ The following is the public MCP tool surface; the companion may perform several 
 | `inspect_dungeondraft_installation` | `live` |
 | `install_dungeondraft_bridge` | `mods_dir`, `confirm`, `replace` |
 | `search_pack_contents` | `searches`, `category`, `packs`, `match_mode`, `limit` |
+| `import_dd2vtt` | `path`, `confirm`, `resize`, `trace`, `walls`, `portals`, `lights`, `ambient`, `wall_asset`, `portal_asset`, `window_asset` |
+| `inspect_map_file` | `path`, `compare_to` |
+| `export_dd2vtt` | `path`, `ppi`, `grid`, `overwrite`, `timeout` |
 | `get_snap_settings` | — |
 | `checkpoint` | `label` |
 | `rollback_checkpoint` | `label` |

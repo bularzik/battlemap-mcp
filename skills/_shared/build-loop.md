@@ -157,8 +157,11 @@ a mistake before anyone can say why.
 ## 3. Correct the foundation
 
 Fix what generation got wrong and finish the structure: wall runs, floor and
-terrain regions, then doors and windows with `add_portal`. Decide each portal's
-VTT behaviour as you place it.
+terrain regions, then doors and windows with `add_portal`. Leave its `closed`
+unset. A VTT export records nothing about a portal but `closed`: it imports a
+closed one as an openable door that blocks sight and an open one as a window,
+so `add_portal` picks closed for a door and open for a window from the asset.
+A door you leave open for the editor's light imports as a window.
 
 This is the last phase that changes the shell. Later phases dress the map; they
 do not rebuild it.

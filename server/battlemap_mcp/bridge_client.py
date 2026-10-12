@@ -44,8 +44,11 @@ TOKEN_REJECTED = "bad or missing token"
 COMPANION_TOOLS = frozenset(
     {
         "clear_captures",
+        "export_dd2vtt",
         "get_export",
+        "import_dd2vtt",
         "inspect_dungeondraft_installation",
+        "inspect_map_file",
         "install_dungeondraft_bridge",
         "prepare_map_with_packs",
         "search_pack_contents",

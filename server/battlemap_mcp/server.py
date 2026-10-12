@@ -38,17 +38,24 @@ from . import (
     handshake,
     installer,
     lifecycle,
+    mapfile,
     pack_contents,
     snapping,
     timing,
     updates,
     user_settings,
+    uvtt,
 )
 from .asset_packs import build_manifest, prepare_map_file, unknown_ids
 from .asset_search import DEFAULT_MIN_SCORE, MATCH_MODES, rank_assets
 from .bridge_client import BridgeClient, BridgeUnavailableError, _state_file
-from .errors import BridgeProtocolError, DungeondraftMCPError, ValidationError
-from .floorplan import WOXELS_PER_TILE, analyse
+from .errors import (
+    BridgeCommandError,
+    BridgeProtocolError,
+    DungeondraftMCPError,
+    ValidationError,
+)
+from .floorplan import WOXELS_PER_TILE, analyse, portal_role, vtt_closed
 from .placement import (
     DEFAULT_TOLERANCE,
     add_bounds,
@@ -94,15 +101,15 @@ INSTRUCTIONS = """\
 Build maps in a live Dungeondraft. Call ping, then get_status: most tools need
 an open map, and get_status gives map_center and map_size_woxels. If ping
 fails, Dungeondraft needs a map open and the bridge mod, which
-install_dungeondraft_bridge installs; do not retry blindly.
+install_dungeondraft_bridge installs; don't retry blindly.
 
-The map is shared: the user and other AI clients can change it between your
-turns. Re-read it before saying what is on it; never answer from memory.
+The map is shared: the user and other clients change it between turns.
+Re-read it before saying what's on it; never answer from memory.
 
 Coordinates are woxels: 256 woxels = 1 tile, origin top-left, y grows DOWN.
-Rects are [x, y, w, h]; rotation is degrees.
+Rects: [x, y, w, h]. Rotation: degrees.
 
-NEVER GUESS an asset path. Pass back one that list_assets returned, verbatim.
+NEVER GUESS an asset path. Pass back one list_assets returned, verbatim.
 A map sees only its own packs; search_pack_contents searches them all.
 
 Order: build_room (walls + floor) -> add_portal -> floors and terrain ->
@@ -112,27 +119,28 @@ Batch: place_objects and delete_elements take many in one undo step;
 list_assets takes `searches`. checkpoint(label) before a multi-step request;
 rollback_checkpoint(label) undoes all of it.
 
-Hex or custom grid? get_snap_settings reports it; snap='auto' places on it.
+Hex or custom grid? get_snap_settings says; snap='auto' follows it.
 
 Floors: place_pattern tiles a room; fill_region / paint_terrain paint blended
-ground; paint_material makes an edged patch; dig_cave carves cave floor.
+ground; paint_material makes an edged patch; dig_cave carves caves.
 
 Use scatter_objects for incidental detail; hand-placed rows read as a grid.
 Establish a focal area, routes and quiet space; vary scale and rotation; run
 shadow paths along walls.
 
-Only draw_wall walls, add_portal doors and add_light lights carry into a VTT.
+Only draw_wall walls, add_portal doors and add_light lights reach a VTT:
+export_dd2vtt writes one, import_dd2vtt rebuilds one.
 
-Look at your work: fit_elements() then screenshot. You see images; the user
-does not, so when they ask to see one, give them its saved file path.
+Look at your work: fit_elements(), screenshot. You see images; the user
+does not, so if they ask to see one, give them its saved file path.
 
 save_map(filename=...) after each stage.
 
 No dedicated tool? list_tool_controls, tool_action, set_tool_option.
 
 If ping or get_status has update_available, tell the user its message and url
-once per session. If they say paused, the user paused you in Dungeondraft:
-tell them, and make no edits until they resume.
+once a session. If they say paused, the user paused you in Dungeondraft:
+tell them; make no edits until they resume.
 """
 
 mcp = MCPServer("battlemap", instructions=INSTRUCTIONS)
@@ -221,6 +229,11 @@ _CAPTURE_NAME = re.compile(
 )
 CAPTURE_RETENTION_ENV = "BATTLEMAP_MCP_CAPTURE_RETENTION"
 
+_TRACE_NAME = re.compile(
+    r"trace-(?:[0-9a-f]{16}\.(?:png|jpg|jpeg|webp|bmp)|[A-Za-z0-9_-]{1,60}-\d{1,5}x\d{1,5}\.jpg)\Z"
+)
+TRACE_KEEP = 3
+
 
 def _capture_keep() -> int:
     """The environment variable if set, else the Dungeondraft panel, else 20."""
@@ -238,7 +251,7 @@ def _capture_root() -> Path:
     return _state_file("mcp_output")
 
 
-def _generated_capture_files() -> list[Path]:
+def _generated_capture_files(pattern: re.Pattern[str] = _CAPTURE_NAME) -> list[Path]:
     """Regular capture files this server is permitted to remove, newest first.
 
     A matching name is necessary but not sufficient: the bridge never writes
@@ -249,7 +262,7 @@ def _generated_capture_files() -> list[Path]:
     captures: list[tuple[int, Path]] = []
     try:
         for path in _capture_root().iterdir():
-            if not _CAPTURE_NAME.fullmatch(path.name) or path.is_symlink() or not path.is_file():
+            if not pattern.fullmatch(path.name) or path.is_symlink() or not path.is_file():
                 continue
             captures.append((path.stat().st_mtime_ns, path))
     except OSError:
@@ -279,6 +292,11 @@ def _remove_captures(captures: list[Path]) -> int:
 def _prune_captures(keep: int | None = None) -> int:
     """Keep the newest configured number of generated captures in mcp_output."""
     return _remove_captures(_generated_capture_files()[_capture_keep() if keep is None else keep :])
+
+
+def _prune_traces(keep: int = TRACE_KEEP) -> int:
+    """Keep the newest trace images the server wrote; the open map's is newest."""
+    return _remove_captures(_generated_capture_files(_TRACE_NAME)[keep:])
 
 
 def _capture_path(reported: object, expected_name: str | None = None) -> str:
@@ -617,7 +635,11 @@ MAX_ANALYSIS_CELLS = 400_000
 
 
 def _read_all(
-    kind: str, *, include_points: bool = False, budget: int = ELEMENT_READ_BUDGET
+    kind: str,
+    *,
+    include_points: bool = False,
+    include_bounds: bool = False,
+    budget: int = ELEMENT_READ_BUDGET,
 ) -> tuple[list, dict]:
     """Every element of one kind, paged, plus how much it actually covered."""
     elements: list = []
@@ -630,6 +652,7 @@ def _read_all(
             limit=500,
             offset=offset,
             include_points=include_points,
+            **({"include_bounds": True} if include_bounds else {}),
         )
         batch = list(page.get("elements", []))
         total = int(page.get("total", len(batch)))
@@ -1409,10 +1432,12 @@ def validate_floorplan(cell_woxels: int = 64, min_room_tiles: float = 1.0) -> di
                              looks like. It cuts no opening in anything.
       portals_to_nowhere     a door whose two sides are the same region, so it
                              connects nothing.
-      exterior_openings      portals connecting a region to the outside. Note
-                             this cannot tell a door from a window — both are
-                             portals — so a building listed here may still have
-                             no way IN. Check the assets before trusting it.
+      exterior_openings      portals connecting a region to the outside. A
+                             window counts too, so a building listed here may
+                             still have no way IN. Check the assets.
+      vtt_reversed_portals   a door with closed=false or a window with
+                             closed=true: in a VTT export it acts as the other.
+                             Delete it and add_portal again without `closed`.
 
     `ok` is true when nothing in the first three lists appeared. Treat it as a
     gate: no furniture, foliage or dressing until it passes, because repairing
@@ -1555,6 +1580,7 @@ def list_elements(
     result = bridge.request("list_elements", **params)
     for element in result.get("elements", []):
         add_bounds(element)
+        _light_in_editor_units(element)
     return result
 
 
@@ -1579,7 +1605,7 @@ def get_element(id: int) -> dict:
     is the part its art actually covers. Fit a bed, rug or shadow to the
     opaque bounds of the objects it goes under, not to their positions.
     """
-    return add_bounds(bridge.request("get_element", id=id))
+    return _light_in_editor_units(add_bounds(bridge.request("get_element", id=id)))
 
 
 @tool()
@@ -2140,20 +2166,35 @@ def draw_path(
     return _with_snap(bridge.request("draw_path", **params), snap_info)
 
 
+EDITOR_RANGE_PER_SCALE = 2.0
+
+
+def _light_in_editor_units(element: Any) -> Any:
+    """Report a light's range as the editor shows it, not as texture_scale."""
+    if isinstance(element, dict) and element.get("kind") == "light":
+        reach = element.get("range")
+        if isinstance(reach, int | float) and not isinstance(reach, bool):
+            element["range"] = round(reach * EDITOR_RANGE_PER_SCALE, 4)
+    return element
+
+
 @tool()
 def add_light(
     x: float | None = None,
     y: float | None = None,
     color: str = "",
     energy: float = 1.0,
-    range: float = 1.0,
+    range: float = 2.0,
     shadows: bool = True,
     asset: str = "",
     snap: str = "",
 ) -> dict:
     """Add a light at a woxel position. Returns the new element id.
 
-    color: '#rrggbb' (default warm). energy: brightness. range: radius scale.
+    color: '#rrggbb' (default warm). energy: brightness.
+    range: the Range Dungeondraft's own Light tool shows, which its saved map
+      and a VTT export record too. get_element and list_elements report it
+      in the same units.
     asset: optional Lights gradient/cookie texture path.
     snap: 'none', 'grid' or 'auto'; see get_snap_settings.
     """
@@ -2164,7 +2205,13 @@ def add_light(
     require_finite(range, "range")
     grid, snap_info = _snap_grid(snap, snapping.VANILLA_TILE)
     x, y = _snap_xy(grid, x, y)
-    params = {"color": color, "energy": energy, "range": range, "shadows": shadows, "asset": asset}
+    params = {
+        "color": color,
+        "energy": energy,
+        "range": range / EDITOR_RANGE_PER_SCALE,
+        "shadows": shadows,
+        "asset": asset,
+    }
     if x is not None:
         params["x"] = x
     if y is not None:
@@ -2177,7 +2224,7 @@ def add_portal(
     asset: str,
     x: float | None = None,
     y: float | None = None,
-    closed: bool = False,
+    closed: bool | None = None,
     radius: float = 64.0,
     mount: str = "wall",
     snap_max: float = 256.0,
@@ -2189,24 +2236,14 @@ def add_portal(
     """Add a door/window portal at a woxel position. Returns the new element id.
 
     By default the portal MOUNTS on the nearest wall and the wall cuts a gap
-    around it (like placing a door by hand).
-
-    asset: a Portals asset path. closed: blocks light.
-    radius: door half-width (~128 ≈ 1-tile door, ~256 ≈ 2-tile door).
-    mount: 'wall' (snap to nearest wall, cut gap) or 'free' (freestanding).
-    snap_max: max woxel distance a wall may be and still capture the portal.
-    flip: reverse the door's facing. fallback_free: if mount='wall' but no wall
-    is within snap_max, place a freestanding portal instead of erroring.
-    rotation: degrees, freestanding only.
-    snap: the GRID option ('none', 'grid', 'auto'; see get_snap_settings),
-      applied to x, y before mounting. Not the same as snap_max.
-    """
+    around it (like placing a door by hand)."""
     require_choice(mount, ["wall", "free"], "mount")
+    chosen = closed if closed is not None else vtt_closed(asset)
     grid, snap_info = _snap_grid(snap)
     x, y = _snap_xy(grid, x, y)
     params = {
         "asset": asset,
-        "closed": closed,
+        "closed": chosen,
         "radius": radius,
         "mount": mount,
         "snap_max": snap_max,
@@ -2219,6 +2256,10 @@ def add_portal(
     if y is not None:
         params["y"] = y
     result = _with_snap(bridge.request("add_portal", **params), snap_info)
+    if isinstance(result, dict):
+        result["closed"] = chosen
+        if closed is None:
+            result["closed_from"] = f"asset ({portal_role(asset)})"
     frame_note = _frame_only_portal_note(asset)
     if frame_note and isinstance(result, dict):
         result["warning"] = frame_note
@@ -2715,7 +2756,8 @@ def paint_material(
     size: brush radius in mesh CELLS, 1-20. A cell is typically one tile, so
       size 6 paints roughly twelve tiles across PER DAB. Start at 1-2 and look.
     layer: which material layer to paint into. Materials on different layers
-      stack rather than merge.
+      stack rather than merge. Keep the default -400 unless you have checked
+      an export: a stroke on -300 showed in the editor but not in an export.
     smooth: smooth the patch's edge, versus following the material's own
       texture.
     erase: remove this material along the stroke instead of adding it.
@@ -2723,6 +2765,7 @@ def paint_material(
     The response reports `cell_size_woxels` and `covered_woxels` so the brush
     size can be reasoned about on the ground. There is no "did it land" flag,
     because the engine offers no reliable one: verify a stroke by looking at it.
+    Each call is one undo step.
     """
     require_points(points, minimum=1)
     if size < 1 or size > 20:
@@ -2821,9 +2864,314 @@ def _short_trace_path(path: str) -> tuple[str, str | None]:
     root.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256(data).hexdigest()[:16]
     target = root / f"trace-{digest}{source.suffix.lower()}"
-    if not target.exists():
+    if target.exists():
+        target.touch()
+    else:
         target.write_bytes(data)
+    _prune_traces()
     return str(target), path
+
+
+DD2VTT_DOOR = "res://textures/portals/door_01.png"
+DD2VTT_WINDOW = "res://textures/portals/window_02.png"
+DD2VTT_CHECKPOINT = "import_dd2vtt"
+# Items listed back in full; past this the reply gives counts.
+DD2VTT_LIST_LIMIT = 100
+
+
+@tool()
+def inspect_map_file(path: str, compare_to: str = "") -> dict:
+    """Summarise a .dungeondraft_map file without opening it. Read-only.
+
+    Works with Dungeondraft closed, and on maps the user downloaded or was
+    sent. Reports what a render cannot show:
+    - `packs`: each pack the map includes, whether it is installed and how
+      many textures use it. `packs_missing` are not installed: those
+      elements will be missing when the map opens. Check this before opening
+      someone else's map.
+    - `packs_used_but_not_included`: elements Dungeondraft drops on load.
+    - per level: element counts, ambient light, terrain slot shares,
+      materials by layer and coverage, paths by texture, width and layer,
+      the most used objects with their scales, lights (range in the editor's
+      units) and portals, with `vtt_reversed`: doors left open or windows
+      closed, which swap roles in a VTT export.
+    - `warnings`: each of the above that will cause a visible problem, and
+      why `installed` is null if the pack folder could not be read.
+
+    compare_to: a second map to compare with, e.g. a rebuild and its
+      original. `comparison` lists count changes, objects and paths only in
+      one map, scale and terrain share changes.
+
+    Lists stop at 25 entries per kind; counts are complete.
+    """
+    # Only the installed check needs the pack folder; a machine without one
+    # set still gets the rest of the summary.
+    installed: dict[str, str] | None = None
+    unchecked = ""
+    try:
+        folder = pack_contents.assets_directory()
+    except ValidationError as exc:
+        unchecked = str(exc)
+    else:
+        installed = {
+            pack_id: str(pack.info.get("name") or pack_id)
+            for pack_id, pack in pack_contents.discover(folder)["packs"].items()
+        }
+
+    def read(file: str) -> dict:
+        target = Path(file).expanduser()
+        try:
+            return mapfile.summarise(mapfile.load(target), installed, target)
+        except mapfile.MapFileError as exc:
+            raise ValidationError(str(exc)) from exc
+
+    summary = read(path)
+    if unchecked and summary["packs"]:
+        summary["warnings"].append(f"could not check which packs are installed: {unchecked}")
+    if compare_to:
+        summary["comparison"] = mapfile.compare(summary, read(compare_to))
+    return summary
+
+
+@tool()
+def export_dd2vtt(
+    path: str = "",
+    ppi: int = 100,
+    grid: bool = False,
+    overwrite: bool = False,
+    timeout: float = 120.0,
+) -> dict:
+    """Write the open map as a Universal VTT file (.dd2vtt) for Foundry, Roll20,
+    Arkenforge and other VTTs. Read-only for the map.
+
+    Contains the map image (rendered like export_map), its walls as sight
+    lines broken at each door and window, every portal (closed = an openable
+    door, open = a window, which is all a VTT can tell), lights, the ambient
+    light, and an outline for each object that blocks light.
+
+    path: absolute file to write. Omitted: beside the saved map, named after
+      it. An existing file is refused unless overwrite=true.
+    ppi: pixels per grid square in the image (Foundry's default is 100).
+    grid: draw the grid into the image; VTTs usually draw their own.
+
+    Object outlines are the drawn area's bounding box, coarser than
+    Dungeondraft's own export. Check `vtt_reversed_portals` from
+    validate_floorplan first: a door left open arrives as a window.
+    """
+    if isinstance(ppi, bool) or not isinstance(ppi, int) or not 10 <= ppi <= 512:
+        raise ValidationError("ppi must be an integer from 10 to 512")
+    _require_wait(timeout)
+    status = bridge.request("get_status")
+    if not status.get("map_open"):
+        raise ValidationError("no map open")
+    if path:
+        target = Path(path).expanduser()
+        if not target.is_absolute():
+            raise ValidationError("path must be absolute")
+    else:
+        saved = str(status.get("map_file") or "")
+        if not saved:
+            raise ValidationError("the map is not saved yet: save_map first, or pass path")
+        target = Path(saved).with_suffix(".dd2vtt")
+    if target.suffix.lower() not in (".dd2vtt", ".uvtt", ".json"):
+        target = target.with_suffix(".dd2vtt")
+    if target.exists() and not overwrite:
+        raise ValidationError(f"{target} exists; pass overwrite=true to replace it")
+    width, height = (int(v) for v in status.get("map_size_woxels") or [0, 0])
+
+    walls, _ = _read_all("walls", include_points=True)
+    portals, _ = _read_all("portals")
+    lights, _ = _read_all("lights")
+    for light in lights:
+        _light_in_editor_units(light)
+    objects, _ = _read_all("objects", include_bounds=True)
+    blockers = [o for o in objects if o.get("block_light")]
+
+    started = bridge.request(
+        "export_map",
+        name=f"export-{uuid4().hex}.png",
+        ppi=ppi,
+        format="png",
+        quality=90,
+        grid=grid,
+    )
+    settled = _wait_for_operation(str(started["operation_id"]), timeout)
+    image = _wait_for_file(_capture_path(settled.get("path")), timeout=10.0)
+    document = uvtt.build(
+        size_tiles=(width / uvtt.WOXELS_PER_GRID, height / uvtt.WOXELS_PER_GRID),
+        pixels_per_grid=ppi,
+        walls=walls,
+        portals=portals,
+        lights=lights,
+        blockers=blockers,
+        ambient=status.get("ambient_light"),
+        image_png=image,
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(document, separators=(",", ":")), encoding="utf-8")
+    return {
+        "path": str(target),
+        "bytes": target.stat().st_size,
+        "map_size_tiles": document["resolution"]["map_size"],
+        "pixels_per_grid": ppi,
+        "line_of_sight": len(document["line_of_sight"]),
+        "portals": len(document["portals"]),
+        "lights": len(document["lights"]),
+        "objects_line_of_sight": len(document["objects_line_of_sight"]),
+        "ambient_light": document["environment"]["ambient_light"],
+    }
+
+
+@tool()
+def import_dd2vtt(
+    path: str,
+    confirm: bool = False,
+    resize: bool = False,
+    trace: bool = True,
+    walls: bool = True,
+    portals: bool = True,
+    lights: bool = True,
+    ambient: bool = True,
+    wall_asset: str = "",
+    portal_asset: str = DD2VTT_DOOR,
+    window_asset: str = DD2VTT_WINDOW,
+) -> dict:
+    """Rebuild a Universal VTT export (.dd2vtt) on the open map.
+
+    Without confirm it only reads the file and reports what it would do.
+    Show the user, then call again with confirm=true. It recreates:
+    - walls from line_of_sight, rejoined through each doorway so doors mount;
+    - portals at their exported width: closed ones (a VTT's doors) as
+      portal_asset, open ones (its windows) as window_asset. The export has
+      no door/window field, so a map that had them reversed comes in
+      reversed; compare with the trace;
+    - lights (colour, range, intensity, shadows) and the ambient light;
+    - the export's image as a trace under the map (trace=false to skip).
+
+    It never picks art: `blockers` lists each sight-blocking object outline
+    (objects_line_of_sight) as center, rotation, length and width in
+    woxels. Place a matching blocking object on each with place_objects.
+
+    The map must be the export's size (`tiles`); resize=true resizes it
+    first. A region export is cropped to its region. Build on a new map:
+    portals mount on the nearest wall, existing walls included.
+
+    One checkpoint, "import_dd2vtt", precedes the edits:
+    rollback_checkpoint("import_dd2vtt") undoes them, except a resize, the
+    ambient light and the trace. Hide the trace with
+    set_trace_image(clear=true) before the final save_map.
+    """
+    try:
+        export = uvtt.read(Path(path).expanduser())
+    except uvtt.UvttError as exc:
+        raise ValidationError(str(exc)) from exc
+    planned = uvtt.plan(export, walls=walls, portals=portals, lights=lights, ambient=ambient)
+    status = bridge.request("get_status")
+    if not status.get("map_open"):
+        raise ValidationError("open a map first; the import builds on the open map")
+    tiles = list(export.tiles)
+    current = [round(v / WOXELS_PER_TILE) for v in status.get("map_size_woxels") or [0, 0]]
+    preview: dict[str, Any] = {
+        "changed": False,
+        "tiles": tiles,
+        "map_tiles": current,
+        "size_matches": current == tiles,
+        "region_origin": list(export.origin),
+        "walls": len(planned.walls),
+        "doorways_joined": planned.joined_doorways,
+        "portals": len(planned.portals),
+        "lights": len(planned.lights),
+        "ambient": planned.ambient,
+        "trace": trace and export.image_span is not None,
+        "blockers": planned.blockers[:DD2VTT_LIST_LIMIT],
+        "blocker_count": len(planned.blockers),
+        "outside_region": {k: v for k, v in planned.skipped.items() if v},
+    }
+    counts = status.get("counts") or {}
+    if any(counts.get(kind) for kind in ("walls", "portals", "lights", "objects")):
+        preview["warning"] = (
+            "this map already has content; imported doors mount on the nearest "
+            "wall, which may be an existing one. A new map is safer."
+        )
+    if not confirm:
+        preview["next"] = "show the user this plan, then call again with confirm=true"
+        return preview
+    if current != tiles:
+        if not resize:
+            return {
+                **preview,
+                "conflict": f"the map is {current[0]}x{current[1]} tiles and the export "
+                f"{tiles[0]}x{tiles[1]}; pass resize=true or open a map of that size",
+            }
+        set_map_size(tiles[0], tiles[1])
+        preview.update(resized_from=current, map_tiles=tiles, size_matches=True)
+
+    bridge.request("checkpoint", label=DD2VTT_CHECKPOINT)
+    failures: list[str] = []
+
+    def attempt(kind: str, call: Callable[..., dict], *args: Any, **kwargs: Any) -> int | None:
+        try:
+            created = call(*args, **kwargs)
+        except (BridgeCommandError, ValidationError) as exc:
+            if len(failures) < DD2VTT_LIST_LIMIT:
+                failures.append(f"{kind}: {exc}")
+            return None
+        return created.get("id") if isinstance(created, dict) else None
+
+    wall_ids = [
+        attempt("wall", draw_wall, w["points"], asset=wall_asset, loop=w["loop"], snap="none")
+        for w in planned.walls
+    ]
+    portal_ids = [
+        attempt(
+            "portal",
+            add_portal,
+            portal_asset if p["closed"] else window_asset,
+            x=p["position"][0],
+            y=p["position"][1],
+            closed=p["closed"],
+            radius=p["radius"],
+            mount="free" if p["freestanding"] else "wall",
+            snap_max=64.0,
+            rotation=p["rotation"],
+            snap="none",
+        )
+        for p in planned.portals
+    ]
+    light_ids = [
+        attempt(
+            "light",
+            add_light,
+            x=light["position"][0],
+            y=light["position"][1],
+            color=light["color"],
+            energy=light["energy"],
+            range=light["range"],
+            shadows=light["shadows"],
+            snap="none",
+        )
+        for light in planned.lights
+    ]
+    if planned.ambient:
+        attempt("ambient", set_ambient_light, planned.ambient)
+    result: dict[str, Any] = {
+        **preview,
+        "changed": True,
+        "checkpoint": DD2VTT_CHECKPOINT,
+        "wall_ids": [i for i in wall_ids if i is not None],
+        "portal_ids": [i for i in portal_ids if i is not None],
+        "light_ids": [i for i in light_ids if i is not None],
+        "failures": failures,
+    }
+    if trace and export.image_span is not None:
+        try:
+            image, scale = uvtt.write_trace_image(export, _capture_root())
+            _prune_traces()
+            result["trace"] = set_trace_image(str(image), scale=scale, opacity=0.5, center=True)
+        except uvtt.UvttError as exc:
+            result["trace"] = {"error": str(exc)}
+    result.pop("next", None)
+    return result
 
 
 @tool()
@@ -2921,7 +3269,12 @@ def set_terrain_blending(enabled: bool) -> dict:
 
 
 @tool()
-def get_terrain(rect: list[float] | None = None, samples: int = 16) -> dict:
+def get_terrain(
+    rect: list[float] | None = None,
+    samples: int = 16,
+    render: bool = False,
+    at: list[float] | None = None,
+) -> dict:
     """Read the terrain back: sample the painted terrain on a grid.
 
     rect: [x, y, w, h] in woxels; omit for the whole map.
@@ -2947,6 +3300,9 @@ def get_terrain(rect: list[float] | None = None, samples: int = 16) -> dict:
     This is the only way to check terrain without a screenshot — use it to
     confirm a fill or paint landed where you meant, and to see what ground you
     inherited on a map you did not build.
+
+    render: also report how the GPU draws it (shader, bound textures, and at
+      `at` = [x, y] the CPU and GPU weights), for ground that reads wrong.
     """
     if rect is not None:
         require_rect(rect)
@@ -2955,6 +3311,11 @@ def get_terrain(rect: list[float] | None = None, samples: int = 16) -> dict:
         if len(rect) != 4:
             raise ValidationError("rect must be [x, y, w, h]")
         params["rect"] = rect
+    if render:
+        params["render"] = True
+        if at is not None:
+            require_points([at], minimum=1)
+            params["at"] = at
     return bridge.request("get_terrain", **params)
 
 
@@ -3876,13 +4237,21 @@ def screenshot(max_px: int | None = None) -> list[Image | str]:
 
 @tool()
 def clear_captures() -> dict:
-    """Remove every server-generated screenshot, export, and asset preview.
+    """Remove every server-generated screenshot, export, and asset preview,
+    and every trace image it wrote but the newest.
 
     This only deletes regular files directly in Dungeondraft's `mcp_output`
     directory whose names the server generates. It never recurses into the
-    directory or removes other files a user has placed there.
+    directory or removes other files a user has placed there. The newest trace
+    is kept because the open map probably uses it; a map whose trace file is
+    gone still opens, without its trace.
     """
-    return {"cleared": _remove_captures(_generated_capture_files())}
+    traces = _generated_capture_files(_TRACE_NAME)
+    return {
+        "cleared": _remove_captures(_generated_capture_files()),
+        "traces_cleared": _remove_captures(traces[1:]),
+        "kept_trace": traces[0].name if traces else None,
+    }
 
 
 EXPORT_WAIT_DEFAULT = 120.0
@@ -3983,9 +4352,8 @@ def export_map(
       nothing — it only makes the copy you look at smaller. `ppi` is the knob
       that makes the render itself faster.
 
-    Universal VTT is NOT available here: it only works from Dungeondraft's own
-    export window. Tell the user to export from the app and choose
-    "Universal VTT".
+    For a Universal VTT file (.dd2vtt) with walls, doors and lights, use
+    export_dd2vtt.
     """
     require_choice(format.lower(), ["png", "jpg", "jpeg", "webp"], "format")
     if isinstance(ppi, bool) or not isinstance(ppi, int) or ppi < 1:
@@ -4280,7 +4648,9 @@ def inspect_dungeondraft_installation(live: bool = False) -> dict:
 
     Check the folder recorded as `[Mods] mods_directory` in config.ini, or the
     platform default when none is set. Dungeondraft can also discover built-in
-    mods, so `other_copies` must not be assumed inactive. Multiple discovery
+    mods, so `other_copies` must not be assumed inactive; one whose status is
+    `duplicate` sits beside the bridge in the loaded folder. A bridge is found
+    by its manifest under any folder name. Multiple discovery
     paths in a log are ambiguous; their order does not identify the loaded copy.
 
     status: healthy | outdated (unmodified, but older than this package) |
@@ -4303,12 +4673,15 @@ def inspect_dungeondraft_installation(live: bool = False) -> dict:
         else next((path for path in candidates if path.is_dir()), candidates[0])
     )
     report = installer.doctor(loaded, state_dir=state_dir)
-    others = []
+    # Matched by manifest, not folder name: Dungeondraft loads a bridge under
+    # any name, so a name check called a dev-named copy missing.
+    others = [{"destination": str(path), "status": "duplicate"} for path in report.other_copies]
     for path in candidates:
-        if path == loaded or not (path / "battlemap-mcp-bridge").is_dir():
+        if path == loaded or not installer.bridge_copies(path):
             continue
         other = installer.doctor(path, state_dir=state_dir)
-        others.append({"destination": str(other.destination), "status": other.status})
+        for copy in (other.destination, *other.other_copies):
+            others.append({"destination": str(copy), "status": other.status})
     evidence = installer.latest_log_evidence(installer.dungeondraft_data_dir())
     return {
         "destination": str(report.destination),
@@ -4372,6 +4745,8 @@ def install_dungeondraft_bridge(
         "actions": list(plan.actions),
         "requires_force": plan.requires_force,
     }
+    if plan.other_copies:
+        preview["other_copies"] = [str(path) for path in plan.other_copies]
     if plan.requires_force:
         preview["note"] = (
             "a bridge is already installed here; with the user's agreement, call "

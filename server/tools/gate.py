@@ -36,6 +36,12 @@ CHECKS: list[tuple[str, list[str], pathlib.Path, bool]] = [
     ("types", [PYTHON, "-m", "mypy", "battlemap_mcp"], SERVER, True),
     ("tests", [PYTHON, "-m", "pytest", "-q"], SERVER, True),
 ]
+# A trial public export, whose content scan nothing else runs. Development
+# only: the exported tree has no exporter, and its own gate skips this.
+if (REPO / "tools" / "export_public.py").exists():
+    CHECKS.append(
+        ("public export", [PYTHON, str(REPO / "tools" / "check_public_export.py")], SERVER, True)
+    )
 
 
 def main() -> int:

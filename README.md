@@ -46,6 +46,12 @@ Keep control of the overall layout while getting help with a room, an outdoor ar
 
 > Furnish the empty room in the northeast as an alchemist's workshop. Keep the walls and doors where they are. Add a main workbench, ingredient storage, and a small reading corner, leaving clear walking space between them. Match the materials and lighting of the adjacent rooms, then show me the result.
 
+### Export to and rebuild from your VTT
+
+Ask for a Universal VTT (`.dd2vtt`) file and the assistant writes one beside your map, with walls, doors, windows and lights for Foundry, Roll20 or Arkenforge. Lost the original map but still have its export? The assistant rebuilds its walls, doors, windows and lights exactly, then rebuilds the art over the export's image. It can also check a `.dungeondraft_map` someone sent you for packs you don't have, before you open it.
+
+> I only have the Universal VTT export of this map: C:\Maps\snow-pass.dd2vtt. Rebuild it on the new map I have open. Show me what you'll import before changing anything, pick packs I own that match the art, and compare your result with the export's image when you're done.
+
 ### Clean up and review
 
 Ask for a second look at a map you've already made, with clear boundaries around what may change.
@@ -66,7 +72,7 @@ The included art-direction and visual-review skills help the assistant plan and 
 
 You need **Dungeondraft 1.2.0.1** and an AI app that can run local MCP servers, on the same computer. There are three ways to connect your AI app. **Pick one:** with two of them, your assistant sees every tool twice.
 
-- **The companion download**, for Codex, Claude Code, OpenCode and other MCP apps: follow steps 1 to 5 below. Codex and Claude Code connect with one double-click; OpenCode with a Connect file and one pasted entry; other apps need a one-time manual setup ([other clients](docs/install-packages.md#other-mcp-clients)).
+- **The companion download**, for Codex, Claude Code, OpenCode and other MCP apps: follow steps 1 to 5 below. Codex, Claude Code and OpenCode connect with one double-click; other apps need a one-time manual setup ([other clients](docs/install-packages.md#other-mcp-clients)).
 - **The Claude desktop app:** install the extension. See [Install from Claude](#install-from-claude).
 - **Claude Code:** install the plugin. See [Install from Claude](#install-from-claude).
 
@@ -109,9 +115,9 @@ If you are replacing an older bridge, save your map and fully quit Dungeondraft 
 3. Open that folder and double-click **Connect Codex**, **Connect Claude Code**
    or **Connect OpenCode**, depending on which app you use. These files end in
    `.cmd`; Windows may hide the extension. They connect the app and add the
-   included map-making skills. OpenCode has no way to be connected
-   automatically, so Connect OpenCode shows you one entry to paste into its
-   settings (see [OpenCode](docs/install-packages.md#other-mcp-clients)).
+   included map-making skills. With OpenCode 1, Connect OpenCode instead
+   shows you one entry to paste into its settings (see
+   [OpenCode](docs/install-packages.md#other-mcp-clients)).
 4. Look for **Setup complete**, then close the window. Fully quit and reopen
    your AI app so it picks up the connection. If the window says Claude Code
    **already has a connection** instead, an earlier install is still registered:

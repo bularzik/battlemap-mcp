@@ -32,6 +32,8 @@ class InstallPlan:
     requires_force: bool
     now: datetime
     records_path: Path
+    # Bridges already in the folder under another name, left in place.
+    other_copies: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,8 @@ class DoctorReport:
     destination: Path
     status: str
     recommended_action: str
+    # Further Battlemap MCP Bridge copies in the same folder, under any name.
+    other_copies: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -330,6 +334,56 @@ def default_mods_dir() -> Path:
     return next((path for path in candidates if path.is_dir()), candidates[0])
 
 
+BRIDGE_DIR_NAME = "battlemap-mcp-bridge"
+
+
+def _bridge_unique_id() -> str | None:
+    """The unique_id in this package's manifest, which names the mod to Dungeondraft."""
+    try:
+        manifest = json.loads(
+            Path(str(payload_root())).joinpath("mcp_bridge.ddmod").read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    value = manifest.get("unique_id") if isinstance(manifest, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
+def bridge_copies(mods_dir: Path) -> list[Path]:
+    """Every folder directly in mods_dir that holds an Battlemap MCP Bridge, whatever its name.
+
+    Dungeondraft identifies a mod by its manifest's unique_id, never by the
+    folder. Looking only for this package's folder name called a bridge
+    missing when it sat under a development name, and missed a second copy
+    loading beside it. This package's folder name sorts first.
+    """
+    unique_id = _bridge_unique_id()
+    found: list[Path] = []
+    try:
+        folders = sorted(path for path in mods_dir.iterdir() if path.is_dir())
+    except OSError:
+        folders = []
+    for folder in folders:
+        if folder.name == BRIDGE_DIR_NAME:
+            found.append(folder)
+            continue
+        if unique_id is None:
+            continue
+        try:
+            manifests = list(folder.glob("*.ddmod"))
+        except OSError:
+            continue
+        for manifest in manifests:
+            try:
+                data = json.loads(manifest.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, ValueError):
+                continue
+            if isinstance(data, dict) and data.get("unique_id") == unique_id:
+                found.append(folder)
+                break
+    return sorted(found, key=lambda path: (path.name != BRIDGE_DIR_NAME, path.name))
+
+
 def codex_skills_dir() -> Path:
     """Return Codex's user-scoped skill directory without creating it."""
     codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
@@ -375,14 +429,23 @@ def _skill_state(directory: Path, target: Path) -> str:
 
 def plan_install(mods_dir: Path, now: datetime, *, state_dir: Path) -> InstallPlan:
     """Describe a fresh bridge installation without touching the filesystem."""
-    destination = mods_dir / "battlemap-mcp-bridge"
+    destination = mods_dir / BRIDGE_DIR_NAME
     requires_force = destination.exists()
+    others = tuple(path for path in bridge_copies(mods_dir) if path != destination)
+    actions: tuple[str, ...] = (
+        ("replace existing bridge",) if requires_force else ("install bridge",)
+    )
+    actions += tuple(
+        f"another Battlemap MCP Bridge copy stays at {path}: remove it, or Dungeondraft loads two"
+        for path in others
+    )
     return InstallPlan(
         destination=destination,
-        actions=("replace existing bridge",) if requires_force else ("install bridge",),
+        actions=actions,
         requires_force=requires_force,
         now=now,
         records_path=state_dir / "battlemap-mcp" / "installs.json",
+        other_copies=others,
     )
 
 
@@ -569,22 +632,46 @@ def run_install(
 
 
 def doctor(mods_dir: Path, *, state_dir: Path, _payload: Path | None = None) -> DoctorReport:
-    """Report whether a bridge is present, current, and untouched."""
-    destination = mods_dir / "battlemap-mcp-bridge"
-    if not destination.is_dir():
+    """Report whether a bridge is present, current, and untouched.
+
+    A copy under another folder name is still the bridge: Dungeondraft goes
+    by the manifest's unique_id, and a dev checkout or a hand-extracted ZIP
+    rarely carries this package's folder name.
+    """
+    copies = bridge_copies(mods_dir)
+    if not copies:
         return DoctorReport(
-            destination=destination,
+            destination=mods_dir / BRIDGE_DIR_NAME,
             status="missing",
             recommended_action="Run battlemap-mcp install to install the bridge.",
         )
+    report = _doctor_copy(copies[0], state_dir=state_dir, payload=_payload)
+    if len(copies) == 1:
+        return report
+    others = tuple(copies[1:])
+    return replace(
+        report,
+        other_copies=others,
+        recommended_action=(
+            f"{report.recommended_action} This folder holds {len(copies)} Battlemap MCP Bridge "
+            f"copies ({', '.join(path.name for path in copies)}); keep only one, then "
+            "restart Dungeondraft."
+        ),
+    )
+
+
+def _doctor_copy(destination: Path, *, state_dir: Path, payload: Path | None) -> DoctorReport:
+    """The health of one bridge folder: current, recorded, edited or older."""
 
     installed = _file_hashes(destination)
     # Line endings are ignored, as the live identity check does: v1.0.0's
     # Windows companion bundled a CRLF payload while the mod ZIP was LF.
     installed_content = _content_hashes(destination)
-    payload = _content_hashes(Path(str(_payload if _payload is not None else payload_root())))
-    current = bool(payload) and all(
-        installed_content.get(name) == digest for name, digest in payload.items()
+    expected_content = _content_hashes(
+        Path(str(payload if payload is not None else payload_root()))
+    )
+    current = bool(expected_content) and all(
+        installed_content.get(name) == digest for name, digest in expected_content.items()
     )
 
     records_path = state_dir / "battlemap-mcp" / "installs.json"

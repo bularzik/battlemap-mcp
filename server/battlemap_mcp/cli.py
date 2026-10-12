@@ -303,13 +303,17 @@ def _setup(args: argparse.Namespace) -> int:
 
 
 def _setup_opencode(args: argparse.Namespace, executable: Path) -> int:
-    """Install skills for OpenCode and show the entry its config needs.
+    """Install skills for OpenCode and connect it.
 
-    OpenCode has no command that adds a server, and setup never edits a
-    client's settings file, so the last step is the user's: paste the entry.
+    OpenCode 2.x registers through its own `opencode mcp add --global`. That
+    command silently replaces an entry of the same name, so an existing
+    entry is checked first and one running another command is left alone.
+    Without that command (OpenCode 1.x, or no `opencode` on PATH), setup
+    shows the entry to paste instead: it never edits the file itself.
     """
     try:
         entry = client_config.opencode_entry(executable)
+        command = client_config.opencode_registration_argv(executable)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -317,6 +321,7 @@ def _setup_opencode(args: argparse.Namespace, executable: Path) -> int:
     config = client_config.opencode_config_path()
     plan = installer.plan_codex_skills_install(destination, datetime.now(UTC))
     print(f"install opencode skills: {destination}")
+    print(f"register launcher: {_display_command(command)}")
     if args.dry_run:
         return 0
     if not _confirm(args.yes):
@@ -338,7 +343,22 @@ def _setup_opencode(args: argparse.Namespace, executable: Path) -> int:
         print("Replace its command with this companion's:")
         print(f"  {json.dumps(entry['command'])}")
         return 1
-    print("OpenCode has no command that adds a server, so add this yourself.")
+    registration = client_config.register_opencode(executable)
+    if registration.registered:
+        print("Registered battlemap with OpenCode.")
+        print("Setup complete. Fully quit and reopen OpenCode, then run: opencode mcp list")
+        print("If it says no MCP servers are configured, wait a few seconds and run it")
+        print("again: OpenCode's background service loads them after it starts.")
+        return 0
+    if registration.manual_command is not None:
+        print("`opencode mcp add` failed. You can run it yourself:")
+        print(_display_command(registration.manual_command))
+        print("or add the entry below by hand.")
+    elif registration.client_cli_available:
+        print("This OpenCode cannot add a server itself (that arrived in OpenCode 2),")
+        print("or its config is not plain JSON, so add this yourself.")
+    else:
+        print("The opencode command was not found, so add this yourself.")
     print(f'In {config}, inside "mcp" (create it if missing), add:')
     print(json.dumps({"battlemap": entry}, indent=2)[1:-1].rstrip())
     print("Then fully quit and reopen OpenCode, and run: opencode mcp list")

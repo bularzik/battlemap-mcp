@@ -51,6 +51,13 @@
       "minimum_protocol": 23
     },
     {
+      "name": "battlemap-vtt-rebuild",
+      "path": "skills/battlemap-vtt-rebuild/SKILL.md",
+      "triggers": ["dd2vtt", "universal vtt", "rebuild a map", "reconstruct a battle map"],
+      "requires": ["battlemap-visual-review"],
+      "minimum_protocol": 25
+    },
+    {
       "name": "battlemap-visual-review",
       "path": "skills/battlemap-visual-review/SKILL.md",
       "triggers": ["map review", "screenshot critique", "finish map"],

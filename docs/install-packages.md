@@ -69,8 +69,8 @@ The Windows companion is unsigned, so SmartScreen warnings there are expected.
 
 5. Open **Connect Codex.command**, **Connect Claude Code.command** or
    **Connect OpenCode.command**. These install the bundled skills and register
-   the companion with that client; Connect OpenCode prints an entry for you to
-   paste instead (see [OpenCode](#other-mcp-clients)).
+   the companion with that client (with OpenCode 1, Connect OpenCode prints an
+   entry for you to paste instead; see [OpenCode](#other-mcp-clients)).
 
 6. **If macOS blocks it.** On the signed companion, make sure the Mac is
    online and open it again; that is usually all it takes, and you do not need
@@ -188,7 +188,7 @@ With your chosen client installed, run **one** of these commands:
 ./battlemap-mcp setup --client opencode
 ```
 
-For OpenCode, setup installs the skills and prints the entry to paste (see
+For OpenCode 1, setup prints the entry to paste instead of registering (see
 [OpenCode](#other-mcp-clients)). Read the displayed plan and confirm it. Setup installs the bundled skills and
 registers this companion's permanent path. Restart your client afterward.
 You may run both commands if you use both clients. See [client help](#client-help)
@@ -245,11 +245,18 @@ macOS and Linux, inside the folder you extracted. Your client starts it for
 you. See [technical configuration](TECHNICAL_REFERENCE.md).
 
 **OpenCode:** open **Connect OpenCode** in the companion folder. It installs
-the map-making skills into `~/.config/opencode/skills/` and prints the entry
-for `~/.config/opencode/opencode.json`. OpenCode has no command that adds a
-server, and the Connect file never edits your settings, so paste the entry
-inside `"mcp"` yourself, restart OpenCode, and check with `opencode mcp list`.
-The entry looks like this, with your companion's full path:
+the map-making skills into `~/.config/opencode/skills/` and registers the
+companion with OpenCode 2's `opencode mcp add --global`. That command replaces
+an entry of the same name without asking, so the Connect file first checks
+`~/.config/opencode/opencode.json` and leaves a `battlemap` entry that runs
+another command alone. Restart OpenCode and check with `opencode mcp list`.
+Right after OpenCode's background service starts, it can say no servers are
+configured; wait a few seconds and run it again.
+
+With OpenCode 1, which has no `mcp add`, or without `opencode` on your PATH,
+the Connect file prints the entry instead and never edits your settings: paste
+it inside `"mcp"` yourself. It looks like this, with your companion's full
+path:
 
 ```json
 {

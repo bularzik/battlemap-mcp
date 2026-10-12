@@ -22,8 +22,9 @@ Connect Claude Code needs Claude Code's command-line tool. It does not set up th
 Claude desktop chat app: for that, install battlemap-mcp-<version>.mcpb from the
 release instead of this companion. Use one or the other, not both, or every tool
 appears twice.
-OpenCode has no command that adds a server: its Connect file installs the skills
-and prints the entry to paste into ~/.config/opencode/opencode.json.
+Connect OpenCode installs the skills and registers the companion with
+`opencode mcp add` (OpenCode 2). With OpenCode 1 it prints the entry to paste
+into ~/.config/opencode/opencode.json instead.
 
 Choose the client you use. Setup installs skills and registers this executable;
 it does not install the mod or change Dungeondraft settings. Install the separate

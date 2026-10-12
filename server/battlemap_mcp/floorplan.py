@@ -27,6 +27,7 @@ island in the second flood has no way in.
 
 from __future__ import annotations
 
+import re
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -60,6 +61,29 @@ class Findings:
     portals_not_in_a_wall: list[int] = field(default_factory=list)
     portals_to_nowhere: list[int] = field(default_factory=list)
     exterior_openings: list[int] = field(default_factory=list)
+    vtt_reversed_portals: list[dict] = field(default_factory=list)
+
+
+_WINDOW = re.compile(r"(?i)window")
+_EMPTY_FRAME = re.compile(r"(?i)/window_frames/|[/_]door_frame")
+_DOOR = re.compile(r"(?i)door")
+
+
+def portal_role(asset: str) -> str:
+    """'door', 'window' or 'opening', read from a Portals asset path."""
+    name = asset or ""
+    if _EMPTY_FRAME.search(name) or not name:
+        return "opening"
+    if _WINDOW.search(name):
+        return "window"
+    if _DOOR.search(name):
+        return "door"
+    return "opening"
+
+
+def vtt_closed(asset: str) -> bool:
+    """The `closed` a portal needs to behave as itself in a VTT."""
+    return portal_role(asset) == "door"
 
 
 def _segments(walls: list[dict]) -> list[tuple[float, float, float, float]]:
@@ -304,6 +328,22 @@ def analyse(
         elif sides & exterior_components:
             findings.exterior_openings.append(portal_id)
 
+    for portal in portals:
+        asset, closed = portal.get("asset"), portal.get("closed")
+        role = portal_role(asset) if isinstance(asset, str) else "opening"
+        if role == "opening" or not isinstance(closed, bool) or closed == (role == "door"):
+            continue
+        findings.vtt_reversed_portals.append(
+            {
+                "id": int(portal.get("id", -1)),
+                "role": role,
+                "closed": closed,
+                "imports_as": "an openable door that blocks sight"
+                if closed
+                else "a window that cannot be opened and that sight passes",
+            }
+        )
+
     return {
         "cell_woxels": cell,
         "grid": {"columns": columns, "rows": rows},
@@ -323,8 +363,12 @@ def analyse(
             "portals_not_in_a_wall": findings.portals_not_in_a_wall,
             "portals_to_nowhere": findings.portals_to_nowhere,
             "exterior_openings": findings.exterior_openings,
+            "vtt_reversed_portals": findings.vtt_reversed_portals,
         },
         "ok": not (
-            findings.sealed_regions or findings.portals_not_in_a_wall or findings.portals_to_nowhere
+            findings.sealed_regions
+            or findings.portals_not_in_a_wall
+            or findings.portals_to_nowhere
+            or findings.vtt_reversed_portals
         ),
     }

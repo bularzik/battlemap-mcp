@@ -62,6 +62,7 @@ SERVER_FILES = (
     "pack_contents.py",
     "installer.py",
     "lifecycle.py",
+    "mapfile.py",
     "placement.py",
     "preflight.py",
     "scene.py",
@@ -71,6 +72,7 @@ SERVER_FILES = (
     "timing.py",
     "updates.py",
     "user_settings.py",
+    "uvtt.py",
     "validation.py",
 )
 SKILL_FILES = (
@@ -88,6 +90,7 @@ SKILL_FILES = (
             "lighting-hierarchy",
             "material-language",
             "visual-review",
+            "vtt-rebuild",
         )
     ),
 )

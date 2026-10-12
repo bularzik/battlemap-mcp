@@ -43,6 +43,15 @@ REQUIRED = {
         "screenshot",
     },
     "battlemap-visual-review": {"screenshot", "export_map", "at most three"},
+    "battlemap-vtt-rebuild": {
+        "import_dd2vtt",
+        "prepare_map_with_packs",
+        "search_pack_contents",
+        "blockers",
+        "clear=true",
+        "screenshot",
+        "export_map",
+    },
 }
 FORBIDDEN = {"guess an asset path", "build blind", "universal object count"}
 LINK = re.compile(r"\[[^]]+\]\(([^)]+)\)")

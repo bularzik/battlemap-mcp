@@ -219,6 +219,18 @@ def test_verify_live_covers_every_tool_that_can_be_checked_live():
         # Reads pack files from disk; its one bridge read is list_asset_packs,
         # exercised here. Covered with synthetic packs in test_pack_contents.
         "search_pack_contents",
+        # Composes draw_wall, add_portal, add_light, set_ambient_light and
+        # set_trace_image, all exercised here, onto a whole map: it needs an
+        # export file and a map of its size. Planning has unit tests over
+        # synthetic exports (test_uvtt); the UAT's dd2vtt group runs it live.
+        "import_dd2vtt",
+        # Composes list_elements, get_status and export_map, all exercised
+        # here, and writes a file beside the map; the UAT dd2vtt group writes
+        # one and reads it back.
+        "export_dd2vtt",
+        # Reads map files from disk and sends no bridge command at all.
+        # Covered with synthetic maps in test_mapfile.
+        "inspect_map_file",
     }
     missing = tools - covered - cannot_check
     assert not missing, (

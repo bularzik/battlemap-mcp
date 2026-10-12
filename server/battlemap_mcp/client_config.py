@@ -174,24 +174,106 @@ def inspect_registration(path: Path) -> str:
 
 
 def opencode_config_path() -> Path:
-    """OpenCode's global config. It has no command that adds a server, and this
-    module does not write client settings, so setup shows the entry instead."""
+    """OpenCode's global config file."""
     return Path.home() / ".config" / "opencode" / "opencode.json"
 
 
 def opencode_entry(executable: Path) -> dict[str, Any]:
-    """The `mcp` entry OpenCode needs: a local stdio command with no arguments."""
+    """The `mcp` entry OpenCode needs: a local stdio command with no arguments.
+
+    This is the format OpenCode 1.x documents. OpenCode 2.x writes entries
+    under `mcp.servers` but still reads this one.
+    """
     validate_launcher(executable)
     return {"type": "local", "command": [str(executable)], "enabled": True}
 
 
+def opencode_registration_argv(executable: Path) -> list[str]:
+    """OpenCode 2.x's own command for a global local server."""
+    validate_launcher(executable)
+    return ["opencode", "mcp", "add", "--global", "battlemap", "--", str(executable)]
+
+
 def opencode_registered_command(path: Path | None = None) -> list[str] | None:
-    """The command of an existing OpenCode `battlemap` entry, if any."""
+    """The command of an existing global OpenCode `battlemap` entry, if any.
+
+    Reads both formats: OpenCode 2.x's `mcp.servers.<name>` and 1.x's
+    `mcp.<name>`. A 2.x `mcp add` into a 1.x file leaves both in one file,
+    and OpenCode reads it that way. Comments (JSONC) are not parsed: such a
+    file reads as no entry, and `mcp add` would then replace one silently,
+    so register_opencode refuses to run on a file it cannot read.
+    """
     try:
         config = json.loads((path or opencode_config_path()).read_text(encoding="utf-8"))
-        command = config["mcp"]["battlemap"]["command"]
+        mcp = config["mcp"]
     except (OSError, UnicodeError, ValueError, KeyError, TypeError):
         return None
-    if isinstance(command, list) and all(isinstance(part, str) for part in command):
-        return command
+    if not isinstance(mcp, dict):
+        return None
+    servers = mcp.get("servers")
+    for table in (servers if isinstance(servers, dict) else {}, mcp):
+        entry = table.get("battlemap")
+        command = entry.get("command") if isinstance(entry, dict) else None
+        if isinstance(command, list) and all(isinstance(part, str) for part in command):
+            return command
     return None
+
+
+def _opencode_config_unreadable(path: Path) -> bool:
+    """True when the file exists but is not plain JSON this module can check."""
+    if not path.exists():
+        return False
+    try:
+        json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return True
+    return False
+
+
+def register_opencode(
+    executable: Path,
+    runner: Callable[..., Any] = subprocess.run,
+) -> ClientRegistrationResult:
+    """Add the server through `opencode mcp add --global` (OpenCode 2.x).
+
+    That command replaces an entry of the same name without asking, unlike
+    `claude mcp add`, so the caller checks opencode_registered_command first.
+    OpenCode 1.x has no `mcp add`; the result then asks for the manual entry.
+    """
+    command = opencode_registration_argv(executable)
+    launcher = shutil.which(command[0])
+    if launcher is None or _opencode_config_unreadable(opencode_config_path()):
+        return ClientRegistrationResult(
+            registered=False, manual_command=None, client_cli_available=launcher is not None
+        )
+    try:
+        probe = runner(
+            [launcher, "mcp", "add", "--help"],
+            capture_output=True,
+            check=False,
+            shell=False,
+            text=True,
+            timeout=60,
+        )
+        # OpenCode 1.19 has `mcp add` without --global, and the add then fails.
+        if probe.returncode != 0 or "--global" not in f"{probe.stdout}{probe.stderr}":
+            return ClientRegistrationResult(
+                registered=False, manual_command=None, client_cli_available=True
+            )
+        completed = runner(
+            [launcher, *command[1:]],
+            capture_output=True,
+            check=False,
+            shell=False,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ClientRegistrationResult(
+            registered=False, manual_command=command, client_cli_available=True
+        )
+    return ClientRegistrationResult(
+        registered=completed.returncode == 0,
+        manual_command=None if completed.returncode == 0 else command,
+        client_cli_available=True,
+    )

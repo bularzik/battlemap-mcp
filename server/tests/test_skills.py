@@ -1263,3 +1263,29 @@ def test_build_loop_reviews_rooms_at_token_zoom_and_checks_taste_early():
     assert "building's class" in lowered
     assert "climate and culture" in lowered
     assert "token zoom" in review.lower()
+
+
+def test_vtt_rebuild_imports_structure_and_rebuilds_art_by_eye():
+    """Runtime behavior and validation."""
+    text = (REPOSITORY_ROOT / "skills" / "battlemap-vtt-rebuild" / "SKILL.md").read_text()
+    # Packs are fixed at map creation, so they are chosen before the import.
+    assert text.index("prepare_map_with_packs") < text.index("confirm=true")
+    assert "no door/window field" in text and "vtt_reversed_portals" in text
+    # Lessons from the first rebuild: material, not water; one scale.
+    assert "not water" in text and "One scale number for the whole map" in text
+    # The 2026-10-11 skill-guided rebuild fitted each tree's size (scales 0.5
+    # to 2.7 where the original used ~1.5 throughout) and scattered 900
+    # pebbles where the original had gravel terrain.
+    assert "it is the NUMBER that repeats, not the size" in text
+    assert "is a terrain slot, not hundreds of small objects" in text
+    # It also searched packs before checking the core library, which matched.
+    assert text.index("Dungeondraft's own library first") < text.index("search_pack_contents`")
+    # The trace is saved with the map and must be cleared.
+    assert "set_trace_image(clear=true)" in text
+
+
+def test_the_build_loop_says_which_way_closed_goes():
+    """Runtime behavior and validation."""
+    loop = (REPOSITORY_ROOT / "skills" / "_shared" / "build-loop.md").read_text()
+    assert "Leave its `closed`\nunset" in loop
+    assert "openable door" in loop

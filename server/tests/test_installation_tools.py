@@ -92,3 +92,26 @@ def test_the_tool_replaces_an_installed_bridge_only_when_asked(monkeypatch, tmp_
     assert state in backup.parents
     assert (backup / "old-version.txt").read_text() == "1.1.1"
     assert not any(p.name.startswith("battlemap-mcp-bridge.backup") for p in mods_dir.iterdir())
+
+
+def test_inspection_finds_a_bridge_under_a_development_name(monkeypatch, tmp_path):
+    """The 1.2.0 release diagnosis said the bridge was not in the configured
+    folder when it was there under the development folder name."""
+    from shutil import copytree
+
+    from battlemap_mcp import server
+
+    loaded = tmp_path / "mods"
+    fallback = tmp_path / "default-mods"
+    copytree(Path(str(server.installer.payload_root())), loaded / "dev-named-bridge")
+    copytree(Path(str(server.installer.payload_root())), fallback / "old-bridge")
+    monkeypatch.setattr(server.installer, "dungeondraft_data_dir", lambda: tmp_path / "dd")
+    monkeypatch.setattr(server.installer, "default_state_dir", lambda: tmp_path / "state")
+    monkeypatch.setattr(server.installer, "candidate_mods_dirs", lambda: [loaded, fallback])
+
+    report = server.inspect_dungeondraft_installation()
+    assert report["status"] == "healthy"
+    assert report["destination"] == str(loaded / "dev-named-bridge")
+    assert report["other_copies"] == [
+        {"destination": str(fallback / "old-bridge"), "status": "healthy"}
+    ]

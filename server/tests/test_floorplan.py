@@ -117,3 +117,41 @@ def test_tiny_slivers_are_not_reported_as_rooms():
     ]
     report = analyse(MAP, walls, [], min_room_tiles=2.0)
     assert report["region_count"] == 0
+
+
+def test_a_reversed_door_and_window_are_flagged_for_the_vtt():
+    """Runtime behavior and validation."""
+    from battlemap_mcp.floorplan import portal_role, vtt_closed
+
+    walls = [room(1, 0, 0, 1024, 1024)]
+    portals = [
+        {**door(10, 512, 0), "asset": "res://textures/portals/door_01.png", "closed": False},
+        {**door(11, 0, 512), "asset": "res://textures/portals/window_02.png", "closed": True},
+        {**door(12, 1024, 512), "asset": "res://textures/portals/door_01.png", "closed": True},
+        {**door(13, 512, 1024), "asset": "res://packs/x/Window_Sill_A.webp", "closed": False},
+    ]
+    report = analyse((2048, 2048), walls, portals)
+    flagged = {p["id"]: p["role"] for p in report["findings"]["vtt_reversed_portals"]}
+    assert flagged == {10: "door", 11: "window"}
+    assert report["ok"] is False
+    assert vtt_closed("res://textures/portals/door_01.png") is True
+    assert vtt_closed("res://textures/portals/window_02.png") is False
+    assert portal_role("res://packs/x/portals/Door_Frame_Stone.webp") == "opening"
+
+
+def test_add_portal_picks_closed_from_the_asset(monkeypatch):
+    from battlemap_mcp import server
+
+    sent = []
+    monkeypatch.setattr(
+        server.bridge, "request", lambda cmd, **kw: sent.append(kw) or {"ok": True, "id": 1}
+    )
+    door_reply = server.add_portal("res://textures/portals/door_01.png", x=0, y=0, snap="none")
+    window_reply = server.add_portal("res://textures/portals/window_02.png", x=0, y=0, snap="none")
+    forced = server.add_portal(
+        "res://textures/portals/door_01.png", x=0, y=0, closed=False, snap="none"
+    )
+    assert [k["closed"] for k in sent] == [True, False, False]
+    assert door_reply["closed_from"] == "asset (door)"
+    assert window_reply["closed_from"] == "asset (window)"
+    assert "closed_from" not in forced

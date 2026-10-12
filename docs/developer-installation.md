@@ -28,8 +28,9 @@ battlemap-mcp install --client codex
 ```
 
 Use `--client claude-code` for Claude Code. `setup` also accepts
-`--client opencode`, which installs skills and prints the `opencode.json` entry
-to add by hand. To replace existing bridge/skills,
+`--client opencode`, which installs skills and registers through
+`opencode mcp add --global` (OpenCode 2), or prints the `opencode.json` entry
+to add by hand (OpenCode 1). To replace existing bridge/skills,
 add `--force` to preview and install; the installer keeps dated backups outside
 active discovery folders. It checks destination access before asking for
 confirmation, though permissions can still change between preview and writing.

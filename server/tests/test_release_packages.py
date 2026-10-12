@@ -109,6 +109,13 @@ def test_unexpected_skills_rejected(tmp_path):
         release.validate_tree(tmp_path, release.SKILL_FILES)
 
 
+def test_skill_files_match_the_shipped_skills():
+    """1.3 added a skill and no builder knew it: every companion build stopped
+    on "Unexpected payload file", which no offline check had run."""
+    release = release_module()
+    release.validate_tree(release.ROOT / "skills", release.SKILL_FILES)
+
+
 def test_crlf_mod_source_is_rejected(checkout, tmp_path):
     """v1.0.0's Windows companion bundled a CRLF bridge from its runner's
     checkout while the mod ZIP, built on Linux, stayed LF. The smoke test

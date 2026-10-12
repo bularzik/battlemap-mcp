@@ -4,6 +4,69 @@ What changed in each release, written for the people using it. Versions cover
 the companion, the Dungeondraft mod and the map-making skills together; the
 wire protocol between them is versioned separately and is currently 25.
 
+## 1.3.0 — 2026-10-11
+
+Export and rebuild Universal VTT files, check a map before you open it, and
+get doors and windows that behave in your VTT.
+
+**Export for your VTT from the chat.** Ask your assistant for a Universal VTT
+(`.dd2vtt`) file and it writes one beside your map, ready for Foundry, Roll20
+or Arkenforge: the image, walls, doors and windows, lights and ambient light.
+Its walls, doors and lights match Dungeondraft's own export of the same map.
+Objects that block light are outlined as boxes, a little coarser than
+Dungeondraft's own outlines.
+
+**Rebuild a map from a Universal VTT export.** Hand your assistant a
+`.dd2vtt` file and it rebuilds the map's walls, doors and windows, lights and
+ambient light on the open map, and lays the export's image underneath as a
+trace to follow. The walls come back whole, with each door mounted in its
+wall, and a region export is cropped to its region. It shows you the plan
+first and changes nothing until you agree, and one request undoes the whole
+import. It doesn't pick art: it tells your assistant where each
+sight-blocking object stood, and its size, so it can place something that
+matches.
+
+**Doors and windows work right in your VTT.** A Universal VTT export can't
+say "door" or "window"; VTTs go by whether a portal blocks light. Your
+assistant was marking windows as light-blocking and doors as not, so in a VTT
+every door acted as a window and every window as a door. It now sets this
+from the asset: doors block light (an openable door in the VTT), windows don't.
+The structure check names any door or window that would swap roles, and
+rebuilding from an export puts windows back as windows.
+
+**Check a map before you open it.** Your assistant can read a
+`.dungeondraft_map` without opening it: which asset packs it needs and
+whether you have them, what it is built from (terrain, materials, paths,
+the most used objects and their sizes), and doors or windows that would swap
+roles in a VTT. Handy for maps you download or are sent, and for comparing
+two versions of a map.
+
+**Material patches land where you paint them.** Ice, mud and other material
+patches all ended up in the map's top-left corner, wherever they were
+painted, and undo skipped them. They now go where your assistant paints
+them, and each stroke can be undone.
+
+**Light range means what Dungeondraft says.** A light's range used to be
+half the number Dungeondraft's Light tool, your saved map and a VTT export
+show, so "range 6, like in Dungeondraft" made a light half that size. Your
+assistant now sets and reads range in Dungeondraft's own units.
+
+**OpenCode connects in one step.** With OpenCode 2, Connect OpenCode now
+registers the companion itself, as Connect Claude Code does, instead of
+printing an entry to paste. It still leaves an existing entry that runs
+another program alone. OpenCode 1 gets the entry to paste, as before.
+
+**The bridge is found under any folder name.** The installation check, and
+installing or updating the bridge, used to look only for the mod's usual
+folder name. A bridge unpacked under any other name was reported missing, and
+a second copy in the same folder went unnoticed. They now recognise the mod
+itself, whatever its folder is called, and warn when two copies would load.
+
+**Trace images no longer pile up.** Images your assistant lays under a map
+to trace over (including an import's) are now cleaned up like screenshots:
+the newest three are kept, and clearing captures removes all but the newest.
+A map whose trace image is gone still opens, just without its trace.
+
 ## 1.2.0 — 2026-10-06
 
 Install it from Claude, let your assistant search inside every asset pack you

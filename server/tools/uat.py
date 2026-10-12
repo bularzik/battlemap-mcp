@@ -2769,6 +2769,177 @@ def history(u: Uat) -> None:
     u.check("a new edit discards the redo branch", an_edit_discards_redo, needs_dirty=True)
 
 
+@group("dd2vtt")
+def dd2vtt(u: Uat) -> None:
+    """Runtime behavior and validation."""
+    import base64
+    import importlib
+    import io
+    import json
+    import tempfile
+
+    from PIL import Image
+
+    server = importlib.import_module("battlemap_mcp.server")
+
+    def counts():
+        return {
+            kind: u.c.request("list_elements", kind=kind, limit=1)["total"]
+            for kind in ("walls", "portals", "lights")
+        }
+
+    def region_export_rebuilds_and_rolls_back():
+        st = u.c.request("get_status")
+        width, height = (round(v / 256) for v in st["map_size_woxels"])
+        # A region of a larger source map: coordinates are offset by its
+        # origin, and a wall from elsewhere in the source must be dropped.
+        ox, oy = 40, 30
+        room = (u.cx / 256 + ox - 1.5, u.cy / 256 + oy - 5.5)
+
+        def pt(dx, dy):
+            return {"x": room[0] + dx, "y": room[1] + dy}
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (width * 16, height * 16), (90, 70, 50)).save(buffer, "PNG")
+        export = {
+            "format": 0.3,
+            "resolution": {
+                "map_origin": {"x": ox, "y": oy},
+                "map_size": {"x": width, "y": height},
+                "pixels_per_grid": 16,
+            },
+            # A 3x2-tile room whose top wall is broken at a one-tile door.
+            "line_of_sight": [
+                [pt(1, 0), pt(0, 0), pt(0, 2), pt(3, 2), pt(3, 0), pt(2, 0)],
+                [{"x": 1, "y": 1}, {"x": 2, "y": 1}],
+            ],
+            "objects_line_of_sight": [[pt(0.5, 0.5), pt(1, 0.5), pt(1, 1), pt(0.5, 1)]],
+            "portals": [
+                {
+                    "position": pt(1.5, 0),
+                    "bounds": [pt(1, 0), pt(2, 0)],
+                    "rotation": 0,
+                    "closed": True,
+                    "freestanding": False,
+                }
+            ],
+            "environment": {"baked_lighting": True, "ambient_light": "ff808080"},
+            "lights": [
+                {
+                    "position": pt(1.5, 1),
+                    "range": 4,
+                    "intensity": 1,
+                    "color": "ffffb060",
+                    "shadows": True,
+                }
+            ],
+            "image": base64.b64encode(buffer.getvalue()).decode(),
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            path = pathlib.Path(folder) / "uat-region.dd2vtt"
+            path.write_text(json.dumps(export))
+            before = counts()
+            preview = server.import_dd2vtt(str(path), ambient=False)
+            assert preview["changed"] is False and counts() == before, preview
+            assert preview["outside_region"] == {"walls": 1}, preview
+            result = server.import_dd2vtt(str(path), confirm=True, ambient=False)
+        try:
+            assert result["failures"] == [], result["failures"]
+            assert counts() == {
+                "walls": before["walls"] + 1,
+                "portals": before["portals"] + 1,
+                "lights": before["lights"] + 1,
+            }, counts()
+            (wall_id,) = result["wall_ids"]
+            (portal_id,) = result["portal_ids"]
+            wall = server.get_element(wall_id)
+            assert wall.get("loop") is True, wall
+            portal = server.get_element(portal_id)
+            assert portal.get("wall_id") == wall_id, f"door not on the imported wall: {portal}"
+            door = portal["position"]
+            want = (u.cx, u.cy - 5.5 * 256)
+            assert abs(door[0] - want[0]) < 1 and abs(door[1] - want[1]) < 1, (door, want)
+            assert result["trace"]["visible"] is True, result["trace"]
+            assert result["trace"]["scale"] == 16.0, result["trace"]
+            (blocker,) = result["blockers"]
+            assert blocker["length"] == 128.0 and blocker["width"] == 128.0, blocker
+            # And back out: the companion writes the export itself.
+            from battlemap_mcp import uvtt as uvtt_module
+
+            with tempfile.TemporaryDirectory() as out:
+                written = server.export_dd2vtt(path=str(pathlib.Path(out) / "back.dd2vtt"), ppi=16)
+                again = uvtt_module.plan(uvtt_module.read(pathlib.Path(written["path"])))
+            door_back = [
+                p
+                for p in again.portals
+                if abs(p["position"][0] - door[0]) < 1 and abs(p["position"][1] - door[1]) < 1
+            ]
+            assert door_back and door_back[0]["closed"] is True, again.portals
+            assert any(w["loop"] for w in again.walls), "the room's wall came back open"
+            assert written["lights"] >= 1, written
+        finally:
+            rolled = server.rollback_checkpoint("import_dd2vtt")
+            server.set_trace_image(clear=True)
+        time.sleep(0.3)
+        assert counts() == before, f"after rollback {counts()} vs before {before}"
+        return f"wall, door on it, light and trace; one rollback reversed {rolled['kinds']}"
+
+    u.check(
+        "dd2vtt: a region export rebuilds, the door mounts, and it rolls back",
+        region_export_rebuilds_and_rolls_back,
+        needs_dirty=True,
+    )
+
+
+@group("material")
+def material(u: Uat) -> None:
+    """A material stroke lands where it was painted and undoes cleanly."""
+    import importlib
+
+    server = importlib.import_module("battlemap_mcp.server")
+    ppi = 8
+
+    def render():
+        import re
+
+        for item in server.export_map(ppi=ppi, format="png", grid=False):
+            found = re.search(r"Export saved: (.+?\.png)", item) if isinstance(item, str) else None
+            if found:
+                return found.group(1)
+        raise AssertionError("export_map returned no image path")
+
+    def lands_where_painted_and_undoes():
+        materials = u.c.request("list_assets", category="Materials", search="ice", limit=5)
+        assets = [a if isinstance(a, str) else a.get("path") for a in materials["assets"]]
+        if not assets:
+            return "skipped: no ice material in this map's library"
+        # Away from the origin on both axes: every stroke used to land at (0, 0).
+        x, y = u.cx + 1024, u.cy + 1536
+        before = render()
+        depth = u.c.request("get_status")["undo_depth"]
+        # The default layer: a stroke on -300 showed in the editor but not in an
+        # export (2026-10-11, not yet understood), which is its own question.
+        server.paint_material([[x, y]], assets[0], size=2)
+        assert u.c.request("get_status")["undo_depth"] == depth + 1, "the stroke is not in history"
+        painted = render()
+        box = pixel_difference(before, painted)
+        assert box is not None, "the stroke changed nothing in the render"
+        centre = ((box[0] + box[2]) / 2 * 256 / ppi, (box[1] + box[3]) / 2 * 256 / ppi)
+        assert abs(centre[0] - x) < 384 and abs(centre[1] - y) < 384, (
+            f"painted at ({x}, {y}) but the render changed around {centre}"
+        )
+        undone = server.undo()
+        assert undone.get("kind") == "material", undone
+        assert pixel_difference(before, render()) is None, "undo left the stroke behind"
+        return f"landed around ({centre[0]:.0f}, {centre[1]:.0f}) for ({x}, {y}); undo restored it"
+
+    u.check(
+        "material: a stroke lands where painted and undo removes it",
+        lands_where_painted_and_undoes,
+        needs_dirty=True,
+    )
+
+
 @group("asset_search")
 def asset_search(u: Uat) -> None:
     """Searching a LARGE library: the case that used to fail outright."""

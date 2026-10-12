@@ -119,6 +119,8 @@ var _panel = null
 var _panel_labels := {}
 var _panel_controls := {}
 var _last_request := ""
+# paint_material's mesh before its stroke, for the history op _build_op makes.
+var _material_before = null
 
 var _select_tool_enabled := false
 
@@ -893,6 +895,15 @@ func _build_op(cmd, req, result, pre, terrain_before, cave_before = null,
 				"after": lvl.Terrain.CloneSplatImage(),
 				"before2": terrain_before2, "after2": _clone_splat2(lvl),
 				"slots_before": slots_before, "slots_after": _terrain_slots(lvl) }
+	elif cmd == "paint_material" and _material_before != null:
+		var before = _material_before
+		_material_before = null
+		var mesh = _material_mesh(before)
+		if mesh != null:
+			var after = _material_snapshot(Global.World.GetCurrentLevel(), mesh,
+				int(before["layer"]), before["texture"], bool(before["smooth"]))
+			if after != null:
+				return { "kind": "material", "before": before, "after": after }
 	elif cmd in CAVE_CMDS and cave_before != null:
 		if cmd == "set_cave_entrance" and result["result"].get("changed_cells", 0) == 0: return null
 		var after = _cave_snapshot()
@@ -938,6 +949,7 @@ func _do_undo() -> Dictionary:
 		return _ok({ "undone": false, "reason": "nothing to undo" })
 	var blocked = _wall_merge_history_error(_undo_stack.back(), true)
 	if blocked == "": blocked = _cave_history_error(_undo_stack.back())
+	if blocked == "": blocked = _material_history_error(_undo_stack.back())
 	if blocked == "": blocked = _prop_detach_history_error(_undo_stack.back(), true)
 	if blocked != "": return _err(blocked)
 	var op = _undo_stack.pop_back()
@@ -950,6 +962,7 @@ func _do_redo() -> Dictionary:
 		return _ok({ "redone": false, "reason": "nothing to redo" })
 	var blocked = _wall_merge_history_error(_redo_stack.back(), false)
 	if blocked == "": blocked = _cave_history_error(_redo_stack.back())
+	if blocked == "": blocked = _material_history_error(_redo_stack.back())
 	if blocked == "": blocked = _prop_detach_history_error(_redo_stack.back(), false)
 	if blocked != "": return _err(blocked)
 	var op = _redo_stack.pop_back()
@@ -994,7 +1007,7 @@ func _push_undo(op):
 # still steps back through the rest in order; it just cannot reach terrain or
 # cave edits older than that.
 func _holds_snapshot(op) -> bool:
-	return typeof(op) == TYPE_DICTIONARY and (op.get("kind") in ["terrain", "cave"] \
+	return typeof(op) == TYPE_DICTIONARY and (op.get("kind") in ["terrain", "cave", "material"] \
 		or (op.get("kind") == "group" and op.has("terrain_before")))
 
 func _image_bytes(value) -> int:
@@ -1010,9 +1023,10 @@ func _snapshot_bytes(op) -> int:
 	for key in ["before", "after", "before2", "after2", "terrain_before", "terrain_before2"]:
 		total += _image_bytes(op.get(key))
 	for key in ["before", "after"]:
-		var cave = op.get(key)
-		if typeof(cave) == TYPE_DICTIONARY:
-			total += _image_bytes(cave.get("floor")) + _image_bytes(cave.get("entrances"))
+		var held = op.get(key)
+		if typeof(held) == TYPE_DICTIONARY:
+			total += _image_bytes(held.get("floor")) + _image_bytes(held.get("entrances"))
+			total += _image_bytes(held.get("bitmap"))
 	return total
 
 func _snapshot_op_count() -> int:
@@ -1105,6 +1119,8 @@ func _apply_op(op, undo : bool):
 						int(op.get("level", -1)))
 		"cave":
 			_restore_cave(op["before"] if undo else op["after"], int(op.get("level", -1)))
+		"material":
+			_restore_material(op["before"] if undo else op["after"])
 
 func _detach_node(node, id : int):
 
@@ -1980,7 +1996,42 @@ func _restore_splat(img, img2, level_id : int):
 		level.Terrain.RestoreSplat(img)
 	level.Terrain.UpdateSplat()
 
-# Cave edits retain both rasters: rebuilding the floor can also change entrances.
+func _material_snapshot(level, mesh, layer : int, tex, smooth : bool):
+	if mesh == null or not mesh.has_method("get_Bitmap") or not mesh.has_method("SetBitmap"):
+		return null
+	var bm = mesh.get_Bitmap()
+	if not (bm is BitMap):
+		return null
+	return { "level": int(level.ID), "layer": layer, "texture": tex, "smooth": smooth,
+		"bitmap": bm.duplicate(true), "dimensions": Global.World.WoxelDimensions }
+
+func _material_mesh(snap):
+	var level = Global.World.GetCurrentLevel()
+	if level == null or int(level.ID) != int(snap["level"]):
+		return null
+	return level.GetOrMakeMaterialMesh(int(snap["layer"]), snap["texture"], bool(snap["smooth"]))
+
+# Refuse before popping history, as for caves.
+func _material_history_error(op) -> String:
+	if op.get("kind") != "material": return ""
+	var level = Global.World.GetCurrentLevel()
+	if level == null or int(level.ID) != int(op["before"]["level"]):
+		return "select the material edit's original level before undo/redo"
+	if op["before"]["dimensions"] != Global.World.WoxelDimensions:
+		return "the map was resized after this material edit; refusing undo/redo"
+	var mesh = _material_mesh(op["before"])
+	if mesh == null or not (mesh.get_Bitmap() is BitMap) \
+			or mesh.get_Bitmap().get_size() != op["before"]["bitmap"].get_size():
+		return "material mesh unavailable for undo/redo"
+	return ""
+
+func _restore_material(snap) -> void:
+	var mesh = _material_mesh(snap)
+	if mesh == null: return
+	mesh.SetBitmap(snap["bitmap"].duplicate(true))
+	if mesh.has_method("UpdateMesh"):
+		mesh.UpdateMesh()
+
 func _cave_snapshot():
 	var cave = _cave_mesh()
 	if cave == null: return null
@@ -2272,6 +2323,9 @@ func _get_status() -> Dictionary:
 		# mod (the Unofficial Patch shows several on its own). The bridge still
 		# answers, but the user may need to close it.
 		"dialog_open": _dialog_open(),
+		# The Environment tool's map-wide tint. A Universal VTT export carries it,
+		# and nothing else reported it.
+		"ambient_light": _ambient_light(),
 	})
 
 func _dialog_open() -> bool:
@@ -2678,17 +2732,6 @@ func _cave_mesh():
 		return null
 	return brush.call("get_Mesh")
 
-func _mesh_cell(mesh, world : Vector2) -> Vector2:
-	var cs = mesh.get("CellSize")
-	if cs == null and mesh.has_method("get_CellSize"):
-		cs = mesh.call("get_CellSize")
-	if cs == null or float(cs) <= 0.0:
-		return world
-	var buf = 0
-	if mesh.get("MapEdgeBuffer") != null:
-		buf = int(mesh.get("MapEdgeBuffer"))
-	return Vector2(int(floor(world.x / float(cs))) + buf, int(floor(world.y / float(cs))) + buf)
-
 func _paint_material(req : Dictionary) -> Dictionary:
 	var level = Global.World.GetCurrentLevel()
 	if level == null: return _err("no map open")
@@ -2716,11 +2759,13 @@ func _paint_material(req : Dictionary) -> Dictionary:
 	elif mesh.has_method("SetSmooth"):
 		mesh.SetSmooth(smooth)
 	var value = not bool(req.get("erase", false))
+	_material_before = _material_snapshot(level, mesh, layer, tex, smooth)
 	if mesh.has_method("OnDrawingBegin"):
 		mesh.OnDrawingBegin()
 	var dabs := 0
+
 	for world_point in pts:
-		mesh.SetCircle(_mesh_cell(mesh, world_point), size, value)
+		mesh.SetCircle(world_point, size, value)
 		dabs += 1
 	if mesh.has_method("OnDrawingEnd"):
 		mesh.OnDrawingEnd()
@@ -2894,6 +2939,23 @@ func _set_tool_option(req : Dictionary) -> Dictionary:
 	if bool(req.get("disable_after", true)):
 		_release_tool(tool, was_active)
 	return _ok({ "tool": tname, "control": cname, "applied": applied })
+
+func _ambient_light():
+	var level = Global.World.GetCurrentLevel()
+	if level == null or not level.has_method("SaveEnvironment"):
+		return null
+	var env = level.SaveEnvironment()
+	if typeof(env) != TYPE_DICTIONARY:
+		return null
+	var value = env.get("ambient_light")
+	if value is Color:
+		return "#" + value.to_html(false)
+	var text = str(value) if value != null else ""
+	if text.length() == 8 and text.is_valid_hex_number():
+		return "#" + text.substr(2)
+	if text.length() == 6 and text.is_valid_hex_number():
+		return "#" + text
+	return null
 
 func _set_ambient_light(req : Dictionary) -> Dictionary:
 
@@ -3678,6 +3740,10 @@ func _describe_wall_portal(portal, wall) -> Dictionary:
 		"id": _id(portal), "kind": "wall_portal", "wall_id": _id(wall),
 		"position": _vec(pos), "normal": _vec(normal),
 		"facing": rad2deg(normal.angle()),
+		# The portal's own direction along the wall, flip included. A Universal
+		# VTT export's `rotation` is this angle (48 of 48 on a real map); the
+		# outward normal above is derived and loses which way the door hangs.
+		"direction": _vec(tangent),
 		"closed": bool(portal.get("Closed")),
 	}
 	var r = portal.get("Radius")

@@ -1038,3 +1038,56 @@ def test_live_doctor_reports_a_token_mismatch_as_untrusted_not_unavailable(monke
     identity = installer.live_bridge_identity()
     assert identity.status == "untrusted"
     assert "newer token" in identity.detail
+
+
+def test_a_bridge_under_another_folder_name_is_found(tmp_path):
+    """1.2.0 called a dev-named bridge missing: Dungeondraft goes by unique_id."""
+    from shutil import copytree
+
+    from battlemap_mcp.installer import bridge_copies, doctor, payload_root
+
+    mods_dir = tmp_path / "mods"
+    renamed = mods_dir / "Battlemap MCP Bridge 1.2.0"
+    copytree(Path(str(payload_root())), renamed)
+    (mods_dir / "some-other-mod").mkdir()
+    (mods_dir / "some-other-mod" / "other.ddmod").write_text('{"unique_id": "someone.Else"}')
+
+    assert bridge_copies(mods_dir) == [renamed]
+    report = doctor(mods_dir, state_dir=tmp_path / "state")
+    assert report.status == "healthy"
+    assert report.destination == renamed
+    assert report.other_copies == ()
+
+
+def test_two_bridge_copies_in_one_folder_are_reported(tmp_path):
+    from shutil import copytree
+
+    from battlemap_mcp.installer import (
+        BRIDGE_DIR_NAME,
+        doctor,
+        payload_root,
+        plan_install,
+    )
+
+    mods_dir = tmp_path / "mods"
+    copytree(Path(str(payload_root())), mods_dir / BRIDGE_DIR_NAME)
+    copytree(Path(str(payload_root())), mods_dir / "dev-bridge")
+
+    report = doctor(mods_dir, state_dir=tmp_path / "state")
+    assert report.destination == mods_dir / BRIDGE_DIR_NAME
+    assert report.other_copies == (mods_dir / "dev-bridge",)
+    assert "keep only one" in report.recommended_action
+
+    plan = plan_install(mods_dir, FIXED_NOW, state_dir=tmp_path / "state")
+    assert plan.other_copies == (mods_dir / "dev-bridge",)
+    assert any("dev-bridge" in action for action in plan.actions)
+
+
+def test_an_unreadable_manifest_is_not_a_bridge(tmp_path):
+    from battlemap_mcp.installer import bridge_copies
+
+    mods_dir = tmp_path / "mods"
+    (mods_dir / "broken").mkdir(parents=True)
+    (mods_dir / "broken" / "mcp_bridge.ddmod").write_text("{not json")
+    assert bridge_copies(mods_dir) == []
+    assert bridge_copies(tmp_path / "absent") == []

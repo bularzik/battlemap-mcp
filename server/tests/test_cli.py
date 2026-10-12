@@ -766,24 +766,50 @@ def opencode_home(monkeypatch, tmp_path):
     return home / ".config" / "opencode"
 
 
-def test_opencode_setup_installs_skills_and_shows_the_entry(monkeypatch, tmp_path, capsys):
+def test_opencode_setup_installs_skills_and_registers(monkeypatch, tmp_path, capsys):
     """Runtime behavior and validation."""
-    import json
-
     from battlemap_mcp import cli
+    from battlemap_mcp.client_config import ClientRegistrationResult
 
     config_dir = opencode_home(monkeypatch, tmp_path)
-    monkeypatch.setattr(
-        cli.client_config,
-        "register_client",
-        lambda *a: pytest.fail("OpenCode has no registration command to run"),
-    )
+    calls = []
+
+    def register(executable):
+        calls.append(executable)
+        return ClientRegistrationResult(registered=True, manual_command=None)
+
+    monkeypatch.setattr(cli.client_config, "register_opencode", register)
     launcher = tmp_path / "companion"
     args = ["setup", "--client", "opencode", "--server-executable", str(launcher), "--yes"]
     assert cli.main(args) == 0
     assert (config_dir / "skills" / "battlemap-interiors" / "SKILL.md").is_file()
+    assert calls == [launcher]
+    output = capsys.readouterr().out
+    assert "Registered battlemap with OpenCode" in output
+    assert "wait a few seconds" in output
+
+
+def test_opencode_setup_shows_the_entry_without_mcp_add(monkeypatch, tmp_path, capsys):
+    """OpenCode 1.x, or no opencode command: setup never writes the file itself."""
+    import json
+
+    from battlemap_mcp import cli
+    from battlemap_mcp.client_config import ClientRegistrationResult
+
+    config_dir = opencode_home(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        cli.client_config,
+        "register_opencode",
+        lambda executable: ClientRegistrationResult(
+            registered=False, manual_command=None, client_cli_available=False
+        ),
+    )
+    launcher = tmp_path / "companion"
+    args = ["setup", "--client", "opencode", "--server-executable", str(launcher), "--yes"]
+    assert cli.main(args) == 0
     assert not (config_dir / "opencode.json").exists()
     output = capsys.readouterr().out
+    assert "opencode command was not found" in output
     pasted = json.loads("{" + output.split("add:\n", 1)[1].split("\nThen", 1)[0] + "}")
     assert pasted == {"battlemap": {"type": "local", "command": [str(launcher)], "enabled": True}}
 
@@ -804,6 +830,11 @@ def test_opencode_setup_recognises_its_own_entry_and_a_foreign_one(monkeypatch, 
         }
     }
     config.write_text(json.dumps(original))
+    monkeypatch.setattr(
+        cli.client_config,
+        "register_opencode",
+        lambda *a: pytest.fail("mcp add would replace an existing entry"),
+    )
     args = ["setup", "--client", "opencode", "--server-executable", str(launcher), "--yes"]
     assert cli.main(args) == 0
     assert "already runs this companion" in capsys.readouterr().out
@@ -812,3 +843,32 @@ def test_opencode_setup_recognises_its_own_entry_and_a_foreign_one(monkeypatch, 
     assert cli.main(args) == 1
     assert "/old/companion" in capsys.readouterr().out
     assert json.loads(config.read_text()) == original  # never rewritten
+
+
+def test_an_opencode_2_entry_is_recognised_too(monkeypatch, tmp_path, capsys):
+    """OpenCode 2.x writes `mcp.servers.<name>`, beside any 1.x entries."""
+    import json
+
+    from battlemap_mcp import cli
+
+    config_dir = opencode_home(monkeypatch, tmp_path)
+    config_dir.mkdir(parents=True)
+    launcher = tmp_path / "companion"
+    (config_dir / "opencode.json").write_text(
+        json.dumps(
+            {
+                "mcp": {
+                    "pencil": {"type": "local", "command": ["x"]},
+                    "servers": {"battlemap": {"type": "local", "command": ["/old/one"]}},
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(
+        cli.client_config,
+        "register_opencode",
+        lambda *a: pytest.fail("mcp add would replace an existing entry"),
+    )
+    args = ["setup", "--client", "opencode", "--server-executable", str(launcher), "--yes"]
+    assert cli.main(args) == 1
+    assert "/old/one" in capsys.readouterr().out
