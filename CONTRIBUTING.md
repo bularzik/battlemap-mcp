@@ -27,3 +27,9 @@ After a bridge change, restart the disposable editor, check authenticated `ping`
 Keep changes focused, include behavioral regression coverage where appropriate, and describe validation and remaining limits. Do not include asset packs, maps, credentials, machine-specific paths, or research records. Follow the [code of conduct](CODE_OF_CONDUCT.md); report security problems through [SECURITY.md](SECURITY.md).
 
 User docs live at https://knownframe.com/battlemap-mcp/docs/, which the maintainer updates. If a change alters what users see or do, say in the pull request which page there needs a matching update.
+
+## What happens to your contribution
+
+Development happens in a separate repository, and this one carries curated releases. A pull request here is still the right way to contribute. When it's accepted, it's ported into development, tested against a live Dungeondraft, and released in a later version. Your pull request is then closed with a link to the release that includes it. You're credited as co-author on the commit and by name in the release notes.
+
+Sometimes a change lands in a different shape from the pull request, to fit the rest of the project or the editor's quirks. When that happens, the pull request says why, and you're still credited. Ideas from forks are welcome too: open an issue pointing at the change.

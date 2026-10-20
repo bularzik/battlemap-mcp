@@ -4,6 +4,22 @@ What changed in each release, written for the people using it. Versions cover
 the companion, the Dungeondraft mod and the map-making skills together; the
 wire protocol between them is versioned separately and is currently 25.
 
+## 1.3.1 — 2026-10-20
+
+Objects that block light now reach your VTT, and the user guide has moved to
+knownframe.com.
+
+**Light-blocking objects export to your VTT.** 1.3.0 said a Universal VTT
+export outlines every object that blocks light. It didn't: every one was
+left out, so in Foundry or Roll20 boulders, crates and pillars blocked
+nothing. Each one now arrives as a box outline, as 1.3.0 described. Thanks to
+immortalBan, who found it, traced the cause and proposed the fix (#9).
+
+**The user guide lives at knownframe.com.** Installation, troubleshooting and
+the tool reference are now at https://knownframe.com/battlemap-mcp/docs/.
+The install notes in each download, the Claude desktop extension and the
+Claude Code plugin link there.
+
 ## 1.3.0 — 2026-10-11
 
 Export and rebuild Universal VTT files, check a map before you open it, and

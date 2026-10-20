@@ -424,3 +424,33 @@ def test_an_export_round_trips_through_the_importer(tmp_path):
     assert [p["closed"] for p in planned.portals] == [True, False]
     assert planned.lights[0]["range"] == 6.0 and planned.ambient == "#203040"
     assert len(planned.blockers) == 1
+
+
+def test_light_blockers_get_outlines_from_what_the_bridge_reports():
+    """The bridge lists objects without bounds, so the export must derive them."""
+    listed = [
+        {
+            "id": 1,
+            "position": [1000, 1000],
+            "rotation": 0,
+            "scale": 2.0,
+            "texture_size": [300, 300],
+            "block_light": True,
+        },
+        {"id": 2, "position": [0, 0], "texture_size": [100, 100], "block_light": False},
+    ]
+    blockers = server._light_blockers(listed)
+    assert [b["id"] for b in blockers] == [1]
+    assert blockers[0]["bounds"] == [700.0, 700.0, 1300.0, 1300.0]
+    assert "bounds" not in listed[0]
+    document = uvtt.build(
+        size_tiles=(10, 10),
+        pixels_per_grid=100,
+        walls=[],
+        portals=[],
+        lights=[],
+        blockers=blockers,
+        ambient=None,
+        image_png=base64.b64decode(_png(40, 40)),
+    )
+    assert len(document["objects_line_of_sight"]) == 1
