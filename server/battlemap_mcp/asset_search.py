@@ -17,6 +17,7 @@ easy to oversell:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
@@ -136,3 +137,59 @@ def rank_assets(
             matches.append(match)
     matches.sort(key=lambda m: (-m.score, len(m.path), m.path))
     return matches
+
+
+# Words that name the SAME thing, so a blank under one is worth retrying under
+# another. The bar is equivalence, not relatedness: a desk is not a table and a
+# sconce is not a lantern, and swapping one for the other turns an honest
+# "nothing found" into a confident wrong asset. Spelling variants count; a
+# narrower or broader word does not. Keep a pair out unless a builder asking
+# for one would accept the other without a second thought.
+EQUIVALENT_WORDS: tuple[tuple[str, ...], ...] = (
+    ("rug", "carpet"),
+    ("bookshelf", "bookcase"),
+    ("bookshelves", "bookcases"),
+    ("column", "pillar"),
+    ("couch", "sofa"),
+    ("wardrobe", "armoire"),
+    ("pail", "bucket"),
+    ("barrel", "cask"),
+    ("coffin", "casket"),
+    ("curtain", "drape"),
+    ("candelabra", "candelabrum"),
+    ("armor", "armour"),
+    ("gray", "grey"),
+    ("color", "colour"),
+    ("jewelry", "jewellery"),
+    ("center", "centre"),
+    ("theater", "theatre"),
+)
+# How many rewordings one blank term may cost. Each is a bridge round trip.
+MAX_EQUIVALENT_QUERIES = 3
+
+_EQUIVALENTS: dict[str, tuple[str, ...]] = {
+    word: tuple(other for other in group if other != word)
+    for group in EQUIVALENT_WORDS
+    for word in group
+}
+
+
+def equivalent_queries(query: str) -> list[str]:
+    """The query reworded with true equivalents, one word swapped at a time.
+
+    "red rug" gives ["red carpet"]. A plural is matched by its singular and
+    replaced by the singular, which a substring search still finds the plural
+    with. Words with no equivalent are left alone; a query with none gives [].
+    """
+    lowered = query.lower()
+    out: list[str] = []
+    # Swap the word in place, so the separators the caller chose survive: a
+    # substring search for "rug_red" has to become "carpet_red", not "carpet red".
+    for found in re.finditer(r"[a-z0-9]+", lowered):
+        word = found.group()
+        key = word if word in _EQUIVALENTS else word[:-1] if word.endswith("s") else ""
+        for other in _EQUIVALENTS.get(key, ()):
+            reworded = lowered[: found.start()] + other + lowered[found.end() :]
+            if reworded not in out:
+                out.append(reworded)
+    return out[:MAX_EQUIVALENT_QUERIES]

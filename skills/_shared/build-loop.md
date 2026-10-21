@@ -83,6 +83,9 @@ first. Decide each of these explicitly, and say which you chose:
    scale. Either plan surroundings out to the edges, or set the size first —
    `set_map_size` (8 to 128 tiles a side) keeps the top-left origin and does
    not move what is placed, so shrinking it afterwards cuts into a centred build.
+   To take a map down to the part that matters, from any side, use `crop_map`
+   instead: it previews what would go, and moves everything to fit only when
+   the user agrees.
 2. **Surfaces** — a terrain slot for ground that must BLEND, `place_pattern`
    for a tiled floor, `draw_path`/`paint_path` for a trail, fence line or
    shadow strip, `add_water` for actual water. Plan the line work too: a
@@ -106,6 +109,19 @@ the [style bible](style-bible.md), set the
 [material language](../battlemap-material-language/SKILL.md) and
 [lighting hierarchy](../battlemap-lighting-hierarchy/SKILL.md), then use
 `list_assets` for each asset family. Place nothing until the plan is coherent.
+
+**Find every piece the brief names before you place the first one.** A brief
+that mentions a gallows, a well or a ship's figurehead has told you what the
+scene is about; those are the pieces the user will look for first. List them,
+then look each one up: `list_assets(searches=[...])` takes up to eight at once,
+`pack=` narrows a search to one included pack, and `search_pack_contents`
+finds what this map's packs lack. A miss is something to say, not to paper
+over. If a named piece has no asset, tell the user before building and offer
+the honest options: a pack that has it, a clearly different stand-in they
+agree to, or leaving it out. Never place a lookalike in its place and carry on
+as if it were the thing asked for. When `list_assets` answers with
+`matched_with`, it searched a word naming the same thing, which is fine to use;
+a different object that merely sits near it in meaning is not.
 
 **Open a rollback point for each request.** Call `checkpoint(label)` when you
 start on something the user asked for, and `rollback_checkpoint(label)` if they
@@ -345,7 +361,8 @@ discs that read as stains rather than ground.
 Work the ground and outdoor zones with the
 [environments](../battlemap-environments/SKILL.md) skill, region by region.
 For each: frame it with `set_camera` (or `fit_elements`), build it to its
-assigned level, capture a framed `screenshot`, repair only what that view shows,
+assigned level, capture a framed `screenshot` (`screenshot(rect=[x, y, w, h])`
+aims and shoots in one call), repair only what that view shows,
 then `save_map` and move on.
 
 **Check the user's taste after the first dressed region, not at the end.**
@@ -398,6 +415,10 @@ described one (#87). A forge without tools, a market stall without goods, an
 altar without candles all fail the same way: the asset is right and the thing
 is not legible. Place the supporting props with the anchor, not in a later
 pass, and look at the cluster in a screenshot before moving on.
+`arrange_objects` places most of those neighbours from the anchor's drawn
+edges in one undo step: `around` for the chairs at a table,
+`on_surface` for the bottles on the bar or the candles on the altar, and
+`along_wall` for the back shelf.
 
 `preview_assets` tells you what an asset looks like while you are CHOOSING.
 Nothing tells you how it reads once placed except looking at it in context.
@@ -431,9 +452,10 @@ means those objects were not checked at all, which is not the same as clean.
 
 ## 8. Light the map
 
-Place sources with `add_light` against the ambient set in phase 2, following the
-lighting hierarchy. Lighting is deliberately global: it is what ties separately
-built regions into one scene.
+Place sources against the ambient set in phase 2, following the lighting
+hierarchy: an emitter placed earlier with its `light` already has one, and the
+rest go in as one `add_light(lights=[...])` pass. Lighting is deliberately
+global: it is what ties separately built regions into one scene.
 
 ## 9. Cohesion review
 

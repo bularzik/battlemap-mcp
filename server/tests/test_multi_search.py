@@ -129,3 +129,44 @@ def test_a_single_search_is_unchanged(bridge):
         "res://textures/objects/furniture/round_table_01.png",
         "res://textures/objects/furniture/table_long_02.png",
     ]
+
+
+def test_sizes_follow_their_paths_when_ranking_reorders_them(monkeypatch):
+    """The bridge answers `only=` in catalogue order; the ranking may differ.
+
+    Sizes come back parallel to the bridge's own `assets`, so copying them by
+    position would hand one asset's drawn area to another.
+    """
+    sizes = {path: [100 + i, 200 + i] for i, path in enumerate(CATALOGUE)}
+
+    def request(command, **params):
+        if params.get("only"):
+            wanted = [path for path in CATALOGUE if path in params["only"]]
+            return {
+                "assets": wanted,
+                "colorable": [],
+                "colorable_scanned": True,
+                "sizes": [sizes[path] for path in wanted],
+                "drawn": [[1, 2] + sizes[path] for path in wanted],
+            }
+        return {"assets": CATALOGUE, "matched": len(CATALOGUE), "total": len(CATALOGUE)}
+
+    monkeypatch.setattr(server.bridge, "request", request)
+    single = server.list_assets(search="table", match_mode="tokens")
+    assert single["assets"] == [CATALOGUE[1], CATALOGUE[0]], "the case needs a reorder"
+    many = server.list_assets(searches=["table", "barrel"], match_mode="tokens")
+
+    for listing in [single, *many["results"].values()]:
+        assert listing["sizes"] == [sizes[path] for path in listing["assets"]]
+        assert listing["drawn"] == [[1, 2] + sizes[path] for path in listing["assets"]]
+
+
+def test_an_unscanned_or_older_listing_carries_no_sizes(monkeypatch):
+    def request(command, **params):
+        return {"assets": CATALOGUE, "colorable": [], "sizes": None, "drawn": None}
+
+    monkeypatch.setattr(server.bridge, "request", request)
+    single = server.list_assets(search="table")
+    many = server.list_assets(searches=["table"])
+    assert "sizes" not in single and "drawn" not in single
+    assert "sizes" not in many["results"]["table"]

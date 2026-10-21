@@ -122,8 +122,16 @@ when you review it and is not "fixed" by a later pass.
 
 **A hand lantern does not stand in a corridor.** In halls and passages, light
 from fixtures on the wall — a wall lantern or sconce on the wall line — and
-put the `add_light` on the fixture. A lantern on the floor mid-corridor reads
+put the light on the fixture. A lantern on the floor mid-corridor reads
 as dropped, and its light as a mistake.
+
+**Place an emitter and its light together.** `place_object(light=...)`, or a
+`light` on a `place_objects` entry, creates the light on the object in the
+same undo step, so moving on and undoing never leaves a glow without a lamp.
+Light a whole room or floor in one pass with `add_light(lights=[...])`, which
+is one undo step. To adjust the hierarchy afterwards, change a light in place
+with `modify_object(id=<light>, energy=..., range=..., color=..., shadows=...)`
+rather than deleting and re-adding it; those changes are saved with the map.
 
 ## Verify the hierarchy
 

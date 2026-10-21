@@ -43,6 +43,8 @@ class InstallResult:
     changed: bool
     destination: Path
     backup_destination: Path | None
+    # Other bridge copies moved out of the mods folder: (original, backup).
+    moved_copies: tuple[tuple[Path, Path], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -431,12 +433,17 @@ def plan_install(mods_dir: Path, now: datetime, *, state_dir: Path) -> InstallPl
     """Describe a fresh bridge installation without touching the filesystem."""
     destination = mods_dir / BRIDGE_DIR_NAME
     requires_force = destination.exists()
-    others = tuple(path for path in bridge_copies(mods_dir) if path != destination)
+    # Old in-folder backups are moved out by every install anyway.
+    others = tuple(
+        path
+        for path in bridge_copies(mods_dir)
+        if path != destination and not path.name.startswith(f"{BRIDGE_DIR_NAME}.backup-")
+    )
     actions: tuple[str, ...] = (
         ("replace existing bridge",) if requires_force else ("install bridge",)
     )
     actions += tuple(
-        f"another Battlemap MCP Bridge copy stays at {path}: remove it, or Dungeondraft loads two"
+        f"another Battlemap MCP Bridge copy is at {path}: Dungeondraft loads it too unless moved"
         for path in others
     )
     return InstallPlan(
@@ -449,18 +456,58 @@ def plan_install(mods_dir: Path, now: datetime, *, state_dir: Path) -> InstallPl
     )
 
 
-def apply_install(plan: InstallPlan, *, force: bool) -> InstallResult:
-    """Copy the bridge payload while keeping backups outside Dungeondraft's mods folder."""
+def other_copy_backups(plan: InstallPlan) -> tuple[tuple[Path, Path], ...]:
+    """Runtime behavior and validation."""
+    return tuple(
+        (path, _state_backups_dir(plan) / f"{path.name}.backup-{_stamp(plan)}")
+        for path in plan.other_copies
+    )
+
+
+def _state_backups_dir(plan: InstallPlan) -> Path:
+    return plan.records_path.parent / "backups" / _destination_token(plan.destination)
+
+
+def _stamp(plan: InstallPlan) -> str:
+    return plan.now.strftime("%Y%m%dT%H%M%SZ")
+
+
+def _is_link(path: Path) -> bool:
+    is_junction = getattr(path, "is_junction", None)
+    return path.is_symlink() or bool(is_junction and is_junction())
+
+
+def apply_install(
+    plan: InstallPlan, *, force: bool, move_other_copies: bool = False
+) -> InstallResult:
+    """Copy the bridge payload while keeping backups outside Dungeondraft's mods folder.
+
+    With move_other_copies, every other bridge copy the plan found is backed
+    up beside the replaced one and removed from the mods folder in the same
+    transaction, so Dungeondraft loads one bridge. Nothing is deleted.
+    """
     backup_destination = None
     legacy_backups = tuple(
         sorted(plan.destination.parent.glob(f"{plan.destination.name}.backup-*"))
     )
-    state_backups_dir = plan.records_path.parent / "backups" / _destination_token(plan.destination)
+    state_backups_dir = _state_backups_dir(plan)
     legacy_destinations = tuple(state_backups_dir / backup.name for backup in legacy_backups)
     if any(destination.exists() for destination in legacy_destinations):
         raise InstallConflictError(
             "A bridge backup already exists in the installer state directory"
         )
+    moved = other_copy_backups(plan) if move_other_copies else ()
+    links = [str(original) for original, _ in moved if _is_link(original)]
+    if links:
+        # Following a link would back up and delete the folder it points to.
+        raise InstallConflictError(
+            "These bridge copies are links, which the installer does not move: "
+            + ", ".join(links)
+            + ". Remove the link itself by hand; the folder it points to is not affected."
+        )
+    for _, backup in moved:
+        if backup.exists():
+            raise InstallConflictError(f"Backup already exists: {backup}")
 
     if plan.destination.exists():
         if not force:
@@ -486,9 +533,10 @@ def apply_install(plan: InstallPlan, *, force: bool) -> InstallResult:
         destination_removed = False
         installed = False
         try:
-            if legacy_backups or backup_destination is not None:
+            if legacy_backups or moved or backup_destination is not None:
                 state_backups_dir.mkdir(parents=True, exist_ok=True)
             pairs = list(zip(legacy_backups, legacy_destinations, strict=True))
+            pairs.extend(moved)
             if backup_destination is not None:
                 pairs.append((plan.destination, backup_destination))
             # Verify every backup before deleting anything, including across volumes.
@@ -541,6 +589,7 @@ def apply_install(plan: InstallPlan, *, force: bool) -> InstallResult:
         changed=True,
         destination=plan.destination,
         backup_destination=backup_destination,
+        moved_copies=moved,
     )
 
 

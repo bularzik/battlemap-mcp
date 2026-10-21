@@ -18,7 +18,9 @@ import io
 import json
 import logging
 import os
+import random
 import re
+import shutil
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -34,9 +36,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from pydantic import ValidationError as PydanticValidationError
 
 from . import (
+    __version__,
     arrangement,
+    cropping,
     handshake,
     installer,
+    layout,
     lifecycle,
     mapfile,
     pack_contents,
@@ -47,7 +52,7 @@ from . import (
     uvtt,
 )
 from .asset_packs import build_manifest, prepare_map_file, unknown_ids
-from .asset_search import DEFAULT_MIN_SCORE, MATCH_MODES, rank_assets
+from .asset_search import DEFAULT_MIN_SCORE, MATCH_MODES, equivalent_queries, rank_assets
 from .bridge_client import BridgeClient, BridgeUnavailableError, _state_file
 from .errors import (
     BridgeCommandError,
@@ -58,12 +63,14 @@ from .errors import (
 from .floorplan import WOXELS_PER_TILE, analyse, portal_role, vtt_closed
 from .placement import (
     DEFAULT_TOLERANCE,
+    Box,
     add_bounds,
     find_adrift_fixtures,
     find_intrusions,
     find_lone_kit_parts,
     find_stacks,
     find_surface_overflow,
+    opaque_box_for,
 )
 from .scene import (
     DEFAULT_EMITTER_REACH,
@@ -99,7 +106,7 @@ PORT = int(_PORT_ENV) if _PORT_ENV else None
 
 INSTRUCTIONS = """\
 Build maps in a live Dungeondraft. Call ping, then get_status: most tools need
-an open map, and get_status gives map_center and map_size_woxels. If ping
+an open map; get_status gives map_center and map_size_woxels. If ping
 fails, Dungeondraft needs a map open and the bridge mod, which
 install_dungeondraft_bridge installs; don't retry blindly.
 
@@ -110,37 +117,38 @@ Coordinates are woxels: 256 woxels = 1 tile, origin top-left, y grows DOWN.
 Rects: [x, y, w, h]. Rotation: degrees.
 
 NEVER GUESS an asset path. Pass back one list_assets returned, verbatim.
-A map sees only its own packs; search_pack_contents searches them all.
+A map sees only its packs; search_pack_contents searches them all.
 
-Order: build_room (walls + floor) -> add_portal -> floors and terrain ->
-place_prefab / place_objects -> scatter_objects -> add_light -> look -> save_map.
+Order: build_room (walls + floor) -> add_portal -> floors, terrain ->
+place_prefab / place_objects -> scatter_objects -> add_light -> look ->
+save_map, after each stage.
 
-Batch: place_objects and delete_elements take many in one undo step;
+Batch: place_objects, delete_elements take many in one undo step;
 list_assets takes `searches`. checkpoint(label) before a multi-step request;
 rollback_checkpoint(label) undoes all of it.
 
-Hex or custom grid? get_snap_settings says; snap='auto' follows it.
+Hex or custom grid? get_snap_settings; snap='auto' follows it.
 
 Floors: place_pattern tiles a room; fill_region / paint_terrain paint blended
-ground; paint_material makes an edged patch; dig_cave carves caves.
+ground; paint_material an edged patch; dig_cave caves.
+Resize or crop: set_map_size, crop_map.
 
-Use scatter_objects for incidental detail; hand-placed rows read as a grid.
+scatter_objects for incidental detail; arrange_objects to line walls, seat
+tables, dress surfaces. Hand-placed rows read as a grid.
 Establish a focal area, routes and quiet space; vary scale and rotation; run
 shadow paths along walls.
 
 Only draw_wall walls, add_portal doors and add_light lights reach a VTT:
 export_dd2vtt writes one, import_dd2vtt rebuilds one.
 
-Look at your work: fit_elements(), screenshot. You see images; the user
-does not, so if they ask to see one, give them its saved file path.
-
-save_map(filename=...) after each stage.
+Look: fit_elements(), screenshot. You see images; the user does not:
+if they ask to see one, give them its saved file path.
 
 No dedicated tool? list_tool_controls, tool_action, set_tool_option.
 
 If ping or get_status has update_available, tell the user its message and url
-once a session. If they say paused, the user paused you in Dungeondraft:
-tell them; make no edits until they resume.
+once a session. If they say paused, the user paused you: tell them;
+make no edits until resumed.
 """
 
 mcp = MCPServer("battlemap", instructions=INSTRUCTIONS)
@@ -429,6 +437,10 @@ def ping() -> dict:
     executing mod) and process_id. These identify the running copy and process;
     they do not imply that files subsequently changed on disk are already loaded.
 
+    `companion_version` is this server's release; `bridge_version` is the one
+    in the running bridge's .ddmod (absent from bridges before 1.4). When they
+    differ, `version_note` says which to update.
+
     `update_available` appears when a newer release has been published. The
     companion cannot update itself: pass its message and url to the user.
     """
@@ -449,7 +461,24 @@ def ping() -> dict:
                 "change this, the mods folder it loads holds an old copy — see "
                 "inspect_dungeondraft_installation."
             )
+    _add_versions(result)
     return result
+
+
+def _add_versions(result: dict) -> None:
+    """Runtime behavior and validation."""
+    result["companion_version"] = __version__
+    running = result.get("bridge_version")
+    if not running:
+        result.pop("bridge_version", None)
+        return
+    if running != __version__:
+        result["version_note"] = (
+            f"Dungeondraft is running bridge {running}, and this companion is "
+            f"{__version__}. Install the bridge from this companion "
+            "(install_dungeondraft_bridge) and restart Dungeondraft, or update "
+            "whichever is older."
+        )
 
 
 @tool()
@@ -810,6 +839,9 @@ PATCH_MAP_TILES_MAX = 200
 OBJECT_LAYERS = [*range(-500, 1000, 100), 1100]
 
 MAX_SEARCHES = 8
+# Longest pack id or name list_assets(pack=) accepts. Ids are 8 characters;
+# names are a pack author's title.
+MAX_PACK_REF = 120
 # The most assets one multi-term call returns in total. A term's own `limit`
 # still applies; this is what stops several generous terms compounding into one
 # enormous result. Measured: four terms at limit=40 returned 160 paths in a
@@ -838,11 +870,11 @@ def _candidate_terms(query: str, mode: str) -> list[str]:
     return words
 
 
-def _candidates(category: str, query: str, mode: str, vanilla_only: bool) -> dict:
+def _candidates(category: str, query: str, mode: str, vanilla_only: bool, scope: list[str]) -> dict:
     """Paths worth scoring for this query, filtered in the bridge."""
     request: dict = {
         "category": category,
-        "terms": _candidate_terms(query, mode),
+        "terms": [*_candidate_terms(query, mode), *scope],
         "limit": RANK_CANDIDATE_LIMIT,
     }
     if vanilla_only:
@@ -878,6 +910,33 @@ def _colorable_paths(answer: dict) -> list[str]:
     return out
 
 
+def _sizes_by_path(answer: dict) -> dict[str, tuple[list, list]]:
+    """Each listed asset's canvas size and drawn rect, keyed by its path.
+
+    The bridge reports them parallel to its own `assets`. A ranked search
+    reorders the paths it asked for by name, so they are carried by path, never
+    by position. Empty when the bridge skipped the scan or predates it.
+    """
+    sizes = answer.get("sizes")
+    drawn = answer.get("drawn")
+    if not isinstance(sizes, list) or not isinstance(drawn, list):
+        return {}
+    return {
+        str(path): (size, rect)
+        for path, size, rect in zip(answer.get("assets", []), sizes, drawn, strict=False)
+    }
+
+
+def _size_fields(assets: list[str], by_path: dict[str, tuple[list, list]]) -> dict:
+    """`sizes` and `drawn` parallel to `assets`, or nothing when none were read."""
+    if not by_path:
+        return {}
+    return {
+        "sizes": [by_path.get(path, ([], []))[0] for path in assets],
+        "drawn": [by_path.get(path, ([], []))[1] for path in assets],
+    }
+
+
 def _distinct_terms(searches: list[str]) -> list[str]:
     """The terms as given, minus blanks and repeats, order preserved."""
     seen: set[str] = set()
@@ -899,6 +958,7 @@ def _list_assets_many(
     vanilla_only: bool,
     match_mode: str,
     min_score: float,
+    scope: list[str],
 ) -> dict:
     """Several searches in one call, surveying the category at most once.
 
@@ -932,6 +992,8 @@ def _list_assets_many(
             params = {"category": category, "search": term, "limit": per_term}
             if vanilla_only:
                 params["vanilla_only"] = True
+            if scope:
+                params["terms"] = scope
             answer = bridge.request("list_assets", **params)
             results[term] = {
                 "matched": answer.get("matched", 0),
@@ -941,6 +1003,7 @@ def _list_assets_many(
                     list(answer.get("assets", [])), set(_colorable_paths(answer))
                 ),
                 "colorable_scanned": answer.get("colorable_scanned", False),
+                **_size_fields(list(answer.get("assets", [])), _sizes_by_path(answer)),
             }
             for shared in ("total", "total_unfiltered", "hidden_unusable"):
                 out.setdefault(shared, answer.get(shared, 0))
@@ -951,7 +1014,7 @@ def _list_assets_many(
         survey_complete = True
         chosen: list[str] = []
         for term in terms:
-            everything = _candidates(category, term, match_mode, vanilla_only)
+            everything = _candidates(category, term, match_mode, vanilla_only, scope)
             surveyed = list(everything.get("assets", []))
             for shared in ("total", "total_unfiltered", "hidden_unusable"):
                 out.setdefault(shared, everything.get(shared, 0))
@@ -970,6 +1033,7 @@ def _list_assets_many(
         # One colour-mask scan for every winner, not one per term: the same asset
         # can win for two terms, and the mask is a property of the asset.
         colorable: set[str] = set()
+        by_path: dict[str, tuple[list, list]] = {}
         scanned = True
         if chosen:
             detail = bridge.request(
@@ -977,9 +1041,11 @@ def _list_assets_many(
             )
             colorable = set(_colorable_paths(detail))
             scanned = bool(detail.get("colorable_scanned", False))
+            by_path = _sizes_by_path(detail)
         for entry in results.values():
             entry["colorable"] = _colorable_indices(entry["assets"], colorable)
             entry["colorable_scanned"] = scanned
+            entry.update(_size_fields(entry["assets"], by_path))
 
         out["survey_complete"] = survey_complete
         if not survey_complete:
@@ -991,9 +1057,26 @@ def _list_assets_many(
                 "over the whole category."
             )
 
+    for term, found in results.items():
+        if found["assets"]:
+            continue
+        retried = _retry_with_equivalents(
+            found,
+            term,
+            lambda query: _list_assets_one(
+                category, query, per_term, vanilla_only, match_mode, min_score, scope
+            ),
+        )
+        results[term] = {key: retried[key] for key in TERM_RESULT_KEYS if key in retried}
+
     out["results"] = results
     out["colorable_are"] = "indices into that term's assets"
     out["per_term_limit"] = per_term
+    swapped = {
+        term: found["matched_with"] for term, found in results.items() if "matched_with" in found
+    }
+    if swapped:
+        out["equivalents_used"] = swapped
     empty = [term for term, found in results.items() if not found["assets"]]
     if empty:
         shortfall = (
@@ -1022,6 +1105,13 @@ def list_assets(
             ),
         ),
     ] = None,
+    pack: Annotated[
+        str,
+        Field(
+            max_length=MAX_PACK_REF,
+            description="Id or name of a pack this map includes; limits results to it.",
+        ),
+    ] = "",
 ) -> dict:
     """List asset paths in a category, optionally filtered by a case-insensitive substring.
 
@@ -1029,11 +1119,9 @@ def list_assets(
     search: substring matched against the asset path ('chair', 'door', 'grass').
     Pass a returned path, verbatim, as the 'asset' of the create tools.
 
-    searches: up to 8 terms in one call instead of `search` — tables AND chairs
-    AND barrels. More than 8 is refused; split the call. Results come back
-    under `results`, keyed by term. Terms SHARE a budget of 80 paths, reported
-    as `per_term_limit`, so this is for choosing a handful, not reading the
-    catalogue. Pass `searches` or `search`, not both.
+    searches: up to 8 terms instead of `search` (more is refused; split the
+    call). Results come under `results`, keyed by term, sharing a budget of 80
+    paths (`per_term_limit`): for choosing a handful, not reading the catalogue.
 
     Results depend on the packs THIS MAP includes: none gives the ~1800 core
     assets, a full library over a hundred thousand. If a search comes up thin,
@@ -1041,39 +1129,167 @@ def list_assets(
 
     `colorable` lists INDEXES into `assets` of assets with a colour mask: they
     take `color` at placement, and the mask shows red without one. Colour
-    cannot be changed afterwards — check before choosing. `colorable_scanned`
-    false means the result was too large to scan: narrow the search.
+    cannot be changed afterwards — check before choosing.
 
-    match_mode: 'substring' (default, contiguous); 'tokens' (every word appears
-    anywhere, any order: "table round" finds round_table_01); 'fuzzy' (tokens
-    plus resemblance, so "barrle" lands; ranked, with `scores`). min_score is
-    the 0..1 cutoff for 'fuzzy'. None of these understand meaning — "mug" will
-    not find a tankard — so widen a term or list the category before
-    concluding something is absent.
+    `sizes` [w, h] is each asset's canvas and `drawn` [x, y, w, h] the part its
+    art covers, in woxels at scale 1, parallel to `assets`. Pack art often fills
+    under half its canvas, so fit spacing, rugs and shadows to `drawn`.
+    `colorable_scanned` false: too many to scan for colour or size; narrow it.
 
-    vanilla_only: exclude optional packs, when native assets would otherwise be
-    crowded out of the result page.
+    match_mode: 'substring' (default, contiguous); 'tokens' (every word, any
+    order: "table round" finds round_table_01); 'fuzzy' (tokens plus
+    resemblance, so "barrle" lands; ranked, with `scores`, cut at min_score).
+    None understand meaning: "mug" will not find a tankard. A blank term is
+    retried only under words naming the same thing (rug/carpet, armour/armor);
+    `matched_with` says which matched, `also_tried` lists misses.
+
+    vanilla_only: core assets only, so packs cannot crowd them out of a page.
+    pack: id or name of a pack this map includes (list_asset_packs); results
+    come from it alone. Others are refused, naming the choices.
     """
     require_choice(match_mode, list(MATCH_MODES), "match_mode")
     if not 0.0 <= min_score <= 1.0:
         raise ValidationError(f"min_score must be between 0 and 1, got {min_score}")
+    scope: list[str] = []
+    chosen_pack: dict | None = None
+    if pack.strip():
+        if vanilla_only:
+            raise ValidationError(
+                "pass pack or vanilla_only, not both — core assets belong to no pack"
+            )
+        chosen_pack = _resolve_included_pack(pack)
+        scope = [f"packs/{chosen_pack['id']}/".lower()]
     if searches is not None:
-        return _list_assets_many(
-            category, searches, search, limit, vanilla_only, match_mode, min_score
+        result = _list_assets_many(
+            category, searches, search, limit, vanilla_only, match_mode, min_score, scope
         )
+    else:
+        result = _list_assets_one(
+            category, search, limit, vanilla_only, match_mode, min_score, scope
+        )
+        if search and not result.get("assets"):
+            result = _retry_with_equivalents(
+                result,
+                search,
+                lambda query: _list_assets_one(
+                    category, query, limit, vanilla_only, match_mode, min_score, scope
+                ),
+            )
+    if chosen_pack is not None:
+        result["pack"] = chosen_pack
+    return result
 
+
+# What one term of a multi-search carries back, out of a full single search.
+TERM_RESULT_KEYS = (
+    "matched",
+    "returned",
+    "assets",
+    "scores",
+    "colorable",
+    "colorable_scanned",
+    "sizes",
+    "drawn",
+    "matched_with",
+    "also_tried",
+)
+
+
+def _retry_with_equivalents(empty: dict, query: str, search: Callable[[str], dict]) -> dict:
+    """A blank search retried under words that name the same thing.
+
+    Only true equivalents are tried (rug/carpet, armor/armour; see
+    asset_search.EQUIVALENT_WORDS), and a hit says which wording matched, so
+    the caller is never handed a substitute it did not see being made.
+    """
+    tried: list[str] = []
+    for reworded in equivalent_queries(query):
+        found = search(reworded)
+        if found.get("assets"):
+            found["matched_with"] = reworded
+            found["note"] = (
+                f"nothing matched {query!r}; these matched {reworded!r}, which names "
+                f"the same thing. {found.get('note') or ''}"
+            ).strip()
+            return found
+        tried.append(reworded)
+    if tried:
+        empty["also_tried"] = tried
+    return empty
+
+
+def _resolve_included_pack(wanted: str) -> dict:
+    """The included pack `wanted` names, by id or name, or a refusal listing them.
+
+    Only packs THIS MAP includes resolve: assets from any other are hidden from
+    list_assets and would not survive a reload, so a filter on one could only
+    ever come back empty.
+    """
+    listed = bridge.request("list_asset_packs")
+    included = [
+        {"id": str(p.get("id") or ""), "name": str(p.get("name") or "")}
+        for p in listed.get("included_in_this_map", [])
+        if p.get("id")
+    ]
+    key = wanted.strip().lower()
+    for field in ("id", "name"):
+        exact = [p for p in included if p[field].lower() == key]
+        if len(exact) == 1:
+            return exact[0]
+    partial = [p for p in included if key in p["name"].lower()]
+    if len(partial) == 1:
+        return partial[0]
+    choices = ", ".join(f"{p['id']} ({p['name'] or 'unnamed'})" for p in included)
+    if len(partial) > 1:
+        raise ValidationError(f"pack {wanted!r} matches more than one included pack: {choices}")
+    elsewhere = [
+        p
+        for p in listed.get("installed_but_not_in_this_map", [])
+        if key in (str(p.get("id") or "").lower(), str(p.get("name") or "").lower())
+    ]
+    if elsewhere:
+        raise ValidationError(
+            f"pack {wanted!r} is installed but this map does not include it, so its "
+            "assets cannot be used here; prepare_map_with_packs makes a copy that does. "
+            f"Included packs: {choices or 'none'}"
+        )
+    if not included:
+        raise ValidationError(
+            f"this map includes no asset packs, so pack {wanted!r} cannot match; "
+            "list_asset_packs shows what is installed"
+        )
+    raise ValidationError(f"no included pack is {wanted!r}. Choose one of: {choices}")
+
+
+def _list_assets_one(
+    category: str,
+    search: str,
+    limit: int,
+    vanilla_only: bool,
+    match_mode: str,
+    min_score: float,
+    scope: list[str],
+) -> dict:
+    """One search: filtered in the bridge, or ranked here over its candidates."""
     if match_mode == "substring" or not search:
         params = {"category": category, "search": search, "limit": limit}
         if vanilla_only:
             params["vanilla_only"] = True
-        return bridge.request("list_assets", **params)
+        if scope:
+            params["terms"] = scope
+        answer = bridge.request("list_assets", **params)
+        # A skipped scan sends nulls; say nothing rather than null.
+        for unread in ("sizes", "drawn"):
+            if answer.get(unread) is None:
+                answer.pop(unread, None)
+        return answer
 
     # Ranked modes need the whole category to rank over, which is more than the
     # colour-mask scan will cover — so pull the paths, rank here, then ask for
     # the winners BY NAME. That second call is what keeps `colorable` populated
     # for the handful the caller actually chooses between, which matters
     # because colour is baked at placement and cannot be fixed afterwards.
-    everything = _candidates(category, search, match_mode, vanilla_only)
+    everything = _candidates(category, search, match_mode, vanilla_only, scope)
     surveyed = list(everything.get("assets", []))
     survey_complete = int(everything.get("matched", len(surveyed))) <= len(surveyed)
 
@@ -1122,6 +1338,7 @@ def list_assets(
     result["colorable"] = _colorable_indices(result["assets"], set(_colorable_paths(detail)))
     result["colorable_are"] = "indices into assets"
     result["colorable_scanned"] = detail.get("colorable_scanned", False)
+    result.update(_size_fields(result["assets"], _sizes_by_path(detail)))
     result["note"] = detail.get("note", "")
     if not survey_complete:
         incomplete = (
@@ -1254,7 +1471,8 @@ def preview_assets(
     category: str = "Objects",
     columns: int = 4,
     cell_px: int = 128,
-) -> Image:
+    true_scale: bool = False,
+) -> list[Image | str]:
     """LOOK at candidate assets before committing to one. Read-only.
 
     Asset names are not reliable descriptions: `bench_01` is a stone bench, and
@@ -1281,6 +1499,11 @@ def preview_assets(
     assets: paths from list_assets or search_pack_contents, at most 32.
     category must match them.
     columns: 1-8. cell_px: 32-256, the size each asset is fitted into.
+    true_scale: draw every asset at ONE scale, set by the largest, so relative
+      sizes show; `woxels_per_cell` says what a cell spans.
+
+    Returns the sheet and JSON: per asset, in order, `sizes` [w, h] woxels at
+    scale 1 and `drawn` [x, y, w, h], the opaque part (Objects only).
     """
     if not assets:
         raise ValidationError("assets must not be empty — pass paths from list_assets")
@@ -1299,13 +1522,19 @@ def preview_assets(
         assets=list(assets),
         columns=columns,
         cell_px=cell_px,
+        true_scale=true_scale,
         name="asset_preview.png",
     )
     # Read and decoded here, not handed to Image(path=...), which base64s any
     # file at all without looking at it.
     data = _wait_for_file(_capture_path(result.get("path"), "asset_preview.png"), timeout=10.0)
     _prune_captures()
-    return Image(data=data, format="png")
+    # The sizes go back as data beside the image: a caption gets ignored (S3).
+    facts: dict = {"assets": list(assets), "columns": result.get("columns", columns)}
+    for key in ("sizes", "drawn", "woxels_per_cell", "colorable", "missing"):
+        if result.get(key) is not None:
+            facts[key] = result[key]
+    return [Image(data=data, format="png"), json.dumps(facts, separators=(",", ":"))]
 
 
 @tool()
@@ -1802,6 +2031,56 @@ def get_snap_settings() -> dict:
     return out
 
 
+class LightSpec(BaseModel):
+    """A light's settings, as add_light takes them."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    color: str = ""
+    energy: float = 1.0
+    range: float = 2.0
+    shadows: bool = True
+    asset: str = ""
+
+
+class PlacedLight(LightSpec):
+    """One entry of add_light(lights=[...]): a light and where it goes."""
+
+    x: float | None = None
+    y: float | None = None
+
+
+def _light_params(spec: object, where: str, model: type[LightSpec] = LightSpec) -> dict:
+    """A light entry, validated and turned into bridge params."""
+    if isinstance(spec, model):
+        item = spec
+    else:
+        try:
+            item = model.model_validate(spec)
+        except PydanticValidationError as invalid:
+            raise ValidationError(f"{where}: {invalid.errors()[0]['msg']}") from invalid
+    require_hex_color(item.color, f"{where}.color")
+    require_finite(item.energy, f"{where}.energy")
+    require_finite(item.range, f"{where}.range")
+    params: dict = {
+        "energy": item.energy,
+        "range": item.range / EDITOR_RANGE_PER_SCALE,
+        "shadows": item.shadows,
+    }
+    if item.color:
+        params["color"] = item.color
+    if item.asset:
+        params["asset"] = item.asset
+    if isinstance(item, PlacedLight):
+        require_finite(item.x, f"{where}.x")
+        require_finite(item.y, f"{where}.y")
+        if item.x is not None:
+            params["x"] = item.x
+        if item.y is not None:
+            params["y"] = item.y
+    return params
+
+
 @tool()
 def place_object(
     asset: str,
@@ -1815,6 +2094,7 @@ def place_object(
     modulate: str = "",
     block_light: bool | None = None,
     snap: str = "",
+    light: LightSpec | None = None,
 ) -> dict:
     """Place an object (prop) on the current map. Returns the new element id.
 
@@ -1844,6 +2124,10 @@ def place_object(
       100, so a mug placed on 100 can be buried by it, while 200 puts the mug
       above. `sorting` only reorders siblings within one layer and cannot do
       this. The response reports the layer the object actually landed on.
+
+    light: {color, energy, range, shadows, asset} as in add_light, made at the
+      object's position in the same undo step: a lantern and its glow. The
+      reply carries `light_id`.
     """
     require_positive(scale, "scale")
     require_choice(sorting, [0, 1], "sorting")
@@ -1877,6 +2161,8 @@ def place_object(
         params["modulate"] = modulate
     if block_light is not None:
         params["block_light"] = block_light
+    if light is not None:
+        params["light"] = _light_params(light, "light")
     return _with_snap(bridge.request("place_object", **params), snap_info)
 
 
@@ -1898,6 +2184,7 @@ class PlacedObject(BaseModel):
     color: str = ""
     modulate: str = ""
     block_light: bool | None = None
+    light: LightSpec | None = None
 
 
 @tool()
@@ -1924,9 +2211,9 @@ def place_objects(
       ([first, last] runs of ids) and `colorable_without_color`.
 
     Returns `objects`: one {id, position, layer} per entry, in the order you
-    passed them, plus `ids`. Entries placed from a colourable asset with no
-    color are listed in the note: those are flat red, and colour cannot be
-    added afterwards.
+    passed them (with `light_id` for an entry that has a `light`), plus `ids`.
+    Entries placed from a colourable asset with no color are listed in the
+    note: those are flat red, and colour cannot be added afterwards.
 
     One undo() reverses the whole batch while it is the latest operation.
     snap applies to every entry with an x and y; see get_snap_settings.
@@ -2053,7 +2340,245 @@ def _batch_params(entry: object, where: str) -> dict:
         params["color"] = item.color
     if item.block_light is not None:
         params["block_light"] = item.block_light
+    if item.light is not None:
+        params["light"] = _light_params(item.light, f"{where}.light")
     return params
+
+
+ARRANGE_MODES = ["along_wall", "around", "on_surface"]
+ARRANGE_SHAPES = ["auto", "round", "rect"]
+MAX_ARRANGE_ASSETS = 8
+# The inset an on_surface item keeps from its surface's drawn edge, and the
+# clearance along_wall keeps from corners and doors.
+SURFACE_MARGIN = 12.0
+WALL_MARGIN = 32.0
+
+
+def _arrange_art(assets: list[str], scale: float) -> list[layout.Art]:
+    """Each asset's drawn area, from list_assets. Never its canvas."""
+    answer = bridge.request(
+        "list_assets", category="Objects", only=list(dict.fromkeys(assets)), limit=len(assets)
+    )
+    by_path = _sizes_by_path(answer)
+    arts = []
+    for asset in assets:
+        size, drawn = by_path.get(asset, (None, None))
+        if not size or not drawn:
+            raise ValidationError(
+                f"no drawn area for {asset}: it is not one of this map's Objects, or the "
+                "bridge predates list_assets sizes. arrange_objects fits drawn art, never "
+                "the canvas. No changes were made."
+            )
+        arts.append(layout.art_from(asset, size, drawn, scale))
+    return arts
+
+
+def _wall_half_thickness(wall: dict) -> float:
+    size = wall.get("texture_size")
+    if size and len(size) >= 2 and float(size[1]) > 0:
+        return float(size[1]) / 2.0
+    return layout.DEFAULT_WALL_HALF_THICKNESS
+
+
+def _arrange_target(target_id: int | None, mode: str) -> tuple[dict, Box]:
+    if target_id is None:
+        raise ValidationError(f"mode {mode!r} needs target_id, the table or surface's id")
+    element = bridge.request("get_element", id=target_id)
+    if element.get("kind") != "object":
+        raise ValidationError(f"element {target_id} is a {element.get('kind')}, not an object")
+    box = opaque_box_for(element)
+    if box is None:
+        raise ValidationError(
+            f"object {target_id} reported no drawn area (opaque_rect), and arrange_objects "
+            "never fits to the canvas. No changes were made."
+        )
+    return element, box
+
+
+@tool()
+def arrange_objects(
+    mode: str,
+    assets: Annotated[list[str], Field(min_length=1, max_length=MAX_ARRANGE_ASSETS)],
+    count: Annotated[int | None, Field(ge=1, le=layout.MAX_ARRANGED)] = None,
+    along: Annotated[list[list[float]] | None, Field(min_length=2, max_length=2)] = None,
+    wall_id: int | None = None,
+    toward: Annotated[list[float] | None, Field(min_length=2, max_length=2)] = None,
+    target_id: int | None = None,
+    facing: str = "down",
+    shape: str = "auto",
+    gap: Annotated[float | None, Field(ge=0, le=2048)] = None,
+    margin: Annotated[float | None, Field(ge=0, le=1024)] = None,
+    clearance: Annotated[float, Field(ge=-256, le=1024)] = -16.0,
+    scale: Annotated[float, Field(gt=0, le=10)] = 1.0,
+    layer: int | None = None,
+    color: str = "",
+    jitter: bool = True,
+    seed: int | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """Lay furniture out against a wall, around a table, or on a surface, in ONE undo step.
+
+    Fitted to each asset's DRAWN area (list_assets `drawn`, the target's
+    opaque bounds), never its canvas, so a shelf sits flush to its wall.
+    `assets` are used in turn, repeated to `count`.
+
+    mode='along_wall': backs a row against a wall, fronts into the room.
+      along: [[x0, y0], [x1, y1]], the stretch of wall to line. The nearest
+      parallel wall within 96 woxels is used and reported; `warnings` names
+      any other wall that close (a double wall where two build_room rooms
+      meet: pass wall_id). Corners and portals are kept `margin` (32) clear.
+      toward: a point on the room side; needed when the wall is not a loop.
+      count omitted fills the stretch. gap: fixed spacing, centred; omitted,
+      spare room is shared evenly.
+    mode='around': seats `count` (4) assets around target_id, each facing it.
+      shape 'auto' is round when the table's name says round, else rect
+      (seats per side by length). clearance: gap from the table's drawn edge,
+      negative tucks under (-16). jitter adds a few degrees and woxels so the
+      table does not read as a grid.
+    mode='on_surface': sets `count` (3) items inside target_id's drawn area,
+      `margin` (12) from its edge, turned a little, not overlapping. Layer
+      defaults to one above the surface: 1100 over a 900 surface only with the
+      Unofficial Patch, else refused.
+
+    facing: where each asset's front points at rotation 0. 'down' is how
+    Dungeondraft's own furniture is drawn; pack art may differ, so look, and
+    pass the facing it has. The reply says which was used.
+
+    dry_run: plan only, place nothing. Returns `objects` (with ids when
+    placed), `skipped` for items with no room, and `seed`. One undo() reverses
+    it; color is baked at placement, as in place_object.
+    """
+    require_choice(mode, ARRANGE_MODES, "mode")
+    require_choice(facing, list(layout.FACINGS), "facing")
+    require_choice(shape, ARRANGE_SHAPES, "shape")
+    require_hex_color(color, "color")
+    if layer is not None:
+        require_choice(layer, OBJECT_LAYERS, "layer")
+    if not assets or len(assets) > MAX_ARRANGE_ASSETS:
+        raise ValidationError(f"assets must hold 1 to {MAX_ARRANGE_ASSETS} paths")
+    if count is not None and not 1 <= count <= layout.MAX_ARRANGED:
+        raise ValidationError(f"count must be 1 to {layout.MAX_ARRANGED}")
+    require_positive(scale, "scale")
+    if seed is None:
+        seed = random.randrange(2**31)
+    rng = random.Random(seed)
+    arts = _arrange_art(assets, scale)
+    result: dict[str, Any] = {"mode": mode, "facing": facing}
+    if mode != "along_wall":
+        result["seed"] = seed
+    warnings: list[str] = []
+    try:
+        if mode == "along_wall":
+            if not along or len(along) != 2:
+                raise ValidationError("mode 'along_wall' needs along: [[x0, y0], [x1, y1]]")
+            for index, point in enumerate([*along, *([toward] if toward else [])]):
+                if len(point) != 2:
+                    raise ValidationError("along and toward take [x, y] points")
+                require_finite(point[0], f"point {index} x")
+                require_finite(point[1], f"point {index} y")
+            walls, _ = _read_all("walls", include_points=True)
+            portals, _ = _read_all("portals")
+            choice = layout.choose_wall(walls, along, wall_id)
+            wall = next(w for w in walls if int(w.get("id", -1)) == choice.segment.wall_id)
+            half = _wall_half_thickness(wall)
+            normal = layout.inward_normal(choice.segment, wall, toward, half + 64.0)
+            intervals, kept_clear = layout.free_intervals(
+                choice.segment,
+                along,
+                portals,
+                half_thickness=half,
+                margin=WALL_MARGIN if margin is None else margin,
+            )
+            entries, skipped = layout.plan_along_wall(
+                arts,
+                choice.segment,
+                normal,
+                intervals,
+                count=count,
+                facing=facing,
+                half_thickness=half,
+                gap=gap,
+            )
+            result["wall"] = {
+                "id": choice.segment.wall_id,
+                "segment": choice.index,
+                "points": [
+                    [choice.segment.x0, choice.segment.y0],
+                    [choice.segment.x1, choice.segment.y1],
+                ],
+                "half_thickness": half,
+                "portals_kept_clear": kept_clear,
+            }
+            if choice.others:
+                warnings.append(
+                    f"walls {list(choice.others)} also run along this line, a double wall: "
+                    f"wall {choice.segment.wall_id} was used. A door cuts only one of them; "
+                    "pass wall_id to choose."
+                )
+            if not intervals:
+                warnings.append("no free stretch of this wall once corners and doors are cleared")
+            item_layer = 100 if layer is None else layer
+        else:
+            target, box = _arrange_target(target_id, mode)
+            if mode == "around":
+                used = (
+                    layout.table_shape(str(target.get("asset", ""))) if shape == "auto" else shape
+                )
+                entries, skipped = layout.plan_around(
+                    box,
+                    arts,
+                    count or 4,
+                    shape=used,
+                    facing=facing,
+                    clearance=clearance,
+                    jitter=jitter,
+                    rng=rng,
+                )
+                result["shape"] = used
+                item_layer = 100 if layer is None else layer
+            else:
+                patch = bridge.request("get_status").get("unofficial_patch") or {}
+                item_layer = layout.dressing_layer(
+                    int(target.get("layer", 100) or 0), layer, bool(patch.get("loaded"))
+                )
+                entries, skipped = layout.plan_on_surface(
+                    box,
+                    arts,
+                    count or 3,
+                    margin=SURFACE_MARGIN if margin is None else margin,
+                    rng=rng,
+                )
+            result["target"] = {"id": target_id, "asset": target.get("asset")}
+    except layout.LayoutError as refused:
+        raise ValidationError(f"{refused}. No changes were made.") from refused
+    warnings.extend(layout.orientation_notes(arts, facing, mode))
+    for entry in entries:
+        entry["layer"] = item_layer
+        if color:
+            entry["color"] = color
+    result["layer"] = item_layer
+    result["skipped"] = skipped
+    if warnings:
+        result["warnings"] = warnings
+    if not entries:
+        result["objects"] = []
+        result["placed"] = 0
+        return result
+    items = [_batch_params(entry, f"objects[{index}]") for index, entry in enumerate(entries)]
+    if dry_run:
+        result["dry_run"] = True
+        result["objects"] = items
+        return result
+    placed = bridge.request("place_objects", objects=items)
+    for item, answer in zip(items, placed.get("objects", []), strict=False):
+        item["id"] = answer.get("id")
+    result["objects"] = items
+    result["ids"] = placed.get("ids", [item.get("id") for item in items])
+    result["placed"] = len(items)
+    for key in ("note", "colorable_without_color", "save_warning"):
+        if key in placed:
+            result[key] = placed[key]
+    return result
 
 
 @tool()
@@ -2188,6 +2713,7 @@ def add_light(
     shadows: bool = True,
     asset: str = "",
     snap: str = "",
+    lights: list[PlacedLight] | None = None,
 ) -> dict:
     """Add a light at a woxel position. Returns the new element id.
 
@@ -2197,7 +2723,25 @@ def add_light(
       in the same units.
     asset: optional Lights gradient/cookie texture path.
     snap: 'none', 'grid' or 'auto'; see get_snap_settings.
+
+    lights: up to 100 {x, y, color, energy, range, shadows, asset} entries,
+      added as ONE undo step and all-or-nothing; the other arguments are then
+      ignored. Returns `ids`. A light for an object: place_object(light=...).
+      modify_object changes a placed light's color, energy, range and shadows.
     """
+    if lights is not None:
+        if not lights:
+            raise ValidationError("lights must not be empty")
+        if len(lights) > BATCH_LIMIT:
+            raise ValidationError(f"{len(lights)} lights is past the {BATCH_LIMIT} one call adds")
+        grid, snap_info = _snap_grid(snap, snapping.VANILLA_TILE)
+        entries = []
+        for index, entry in enumerate(lights):
+            item = _light_params(entry, f"lights[{index}]", PlacedLight)
+            if "x" in item and "y" in item:
+                item["x"], item["y"] = _snap_xy(grid, item["x"], item["y"])
+            entries.append(item)
+        return _with_snap(bridge.request("add_light", lights=entries), snap_info)
     require_hex_color(color, "color")
     require_finite(x, "x")
     require_finite(y, "y")
@@ -2477,6 +3021,8 @@ def scatter_objects(
     sorting: int = 0,
     layer: int = 100,
     seed: int | None = None,
+    wall_margin: float | None = None,
+    avoid_rects: list[list[float]] | None = None,
 ) -> dict:
     """Scatter objects randomly over a rectangular area, with jittered scale and rotation.
 
@@ -2500,6 +3046,13 @@ def scatter_objects(
     layer: layer VALUE for every placement (multiple of 100, -500..900, or 1100
       with the Unofficial Patch). Same
       meaning as in place_object; 100 is the default.
+
+    wall_margin: keep each object's drawn art at least this many woxels off
+      every wall (0 = art may touch, never cross). The rect bounds only
+      centres, so without it a tree's crown lands over a wall.
+    avoid_rects: up to 32 [x, y, w, h] areas no object's art may reach into:
+      a path, a doorway, a building.
+    With either, the reply counts `kept_out` attempts.
 
     Returns the ids placed, how many attempts it took, and a note if it could not
     fit the requested count.
@@ -2536,6 +3089,17 @@ def scatter_objects(
         params["color"] = color
     if seed is not None:
         params["seed"] = seed
+    if wall_margin is not None:
+        require_finite(wall_margin, "wall_margin")
+        if wall_margin < 0:
+            raise ValidationError("wall_margin must be 0 or more")
+        params["wall_margin"] = wall_margin
+    if avoid_rects:
+        if len(avoid_rects) > 32:
+            raise ValidationError("avoid_rects is capped at 32 rects")
+        for index, avoid in enumerate(avoid_rects):
+            require_rect(avoid, f"avoid_rects[{index}]")
+        params["avoid_rects"] = avoid_rects
     result = bridge.request("scatter_objects", **params)
     if isinstance(result, dict):
         _SCATTERED.update(int(i) for i in result.get("ids") or [])
@@ -2755,9 +3319,9 @@ def paint_material(
     asset: a Materials path from list_assets(category='Materials').
     size: brush radius in mesh CELLS, 1-20. A cell is typically one tile, so
       size 6 paints roughly twelve tiles across PER DAB. Start at 1-2 and look.
-    layer: which material layer to paint into. Materials on different layers
-      stack rather than merge. Keep the default -400 unless you have checked
-      an export: a stroke on -300 showed in the editor but not in an export.
+    layer: which material layer to paint into, -500 to 900 by 100. Materials
+      on different layers stack rather than merge. -300 and below draw UNDER
+      floors (add_floor, build_room); on a floor, paint at -200 or above.
     smooth: smooth the patch's edge, versus following the material's own
       texture.
     erase: remove this material along the stroke instead of adding it.
@@ -4039,6 +4603,9 @@ def modify_object(
     shadow: bool | None = None,
     layer: int | None = None,
     block_light: bool | None = None,
+    energy: float | None = None,
+    range: float | None = None,
+    shadows: bool | None = None,
 ) -> dict:
     """Modify an existing object's scale, rotation (degrees), color, shadow
     and/or light-blocking by id.
@@ -4058,8 +4625,13 @@ def modify_object(
       or 1100 with the Unofficial Patch).
     Unlike colour this IS changeable after placement, and it is how a map built
     before layers were assigned correctly gets repaired.
+
+    A LIGHT takes color, energy, range and shadows (as add_light), and they do
+    change after placement; nothing else applies to it.
     """
     require_hex_color(color, "color")
+    require_finite(energy, "energy")
+    require_finite(range, "range")
     require_hex_color(modulate, "modulate")
     if modulate:
         raise ValidationError(
@@ -4083,7 +4655,13 @@ def modify_object(
         params["layer"] = layer
     if block_light is not None:
         params["block_light"] = block_light
-    return bridge.request("modify_object", **params)
+    if energy is not None:
+        params["energy"] = energy
+    if range is not None:
+        params["range"] = range / EDITOR_RANGE_PER_SCALE
+    if shadows is not None:
+        params["shadows"] = shadows
+    return _light_in_editor_units(bridge.request("modify_object", **params))
 
 
 @tool()
@@ -4168,8 +4746,107 @@ def set_map_size(
     (get_status.unofficial_patch). The top-left origin is kept: the map grows or
     shrinks on the right and bottom, nothing placed is moved, and shrinking
     does not delete what ends up outside. Set the size before laying out.
+    To trim from the top or left too, use crop_map.
     """
     return bridge.request("set_map_size", width=width, height=height)
+
+
+def _all_elements(kind: str) -> list[dict]:
+    """Every element of one kind on the current level, across list_elements pages."""
+    found: list[dict] = []
+    while True:
+        page = list_elements(
+            kind=kind, limit=500, offset=len(found), include_points=True, include_bounds=True
+        )
+        found.extend(page.get("elements", []))
+        if not page.get("truncated") or not page.get("elements"):
+            return found
+
+
+@tool()
+def crop_map(
+    rect: Annotated[list[int], Field(min_length=4, max_length=4)],
+    confirm: bool = False,
+) -> dict:
+    """Crop the map to a window of TILES, rect=[x, y, w, h], from any side.
+
+    The tile at (x, y) becomes the new top-left and everything moves with it.
+    Choose the window with the user first: keep the focal area, routes and
+    whole rooms (get_composition_snapshot, then screenshot or fit_elements).
+
+    Without confirm this only previews: the new size, and per kind the ids of
+    what lies wholly outside (`outside`, deleted on confirm) and what crosses
+    the edge (`crossing`, kept as it is: a wall or path running off the map
+    is not cut, so mention it, and delete or redraw it if the user wants).
+    Patterns cannot be listed, so a pattern outside stays, off the map.
+
+    confirm=true saves the map and copies the file beside it (`backup`), since
+    a crop cannot be undone, then crops through Dungeondraft's own resize and
+    deletes what was outside as one undo step. Earlier undo history is
+    cleared, because every element moved. Only the current level is cleaned
+    of what lies outside; every level is cropped.
+    """
+    if any(isinstance(v, bool) for v in rect):
+        raise ValidationError("rect is [x, y, w, h] in whole tiles")
+    x, y, w, h = (int(v) for v in rect)
+    status = get_status()
+    width, height = (int(v) // cropping.WOXELS_PER_TILE for v in status["map_size_woxels"])
+    if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > width or y + h > height:
+        raise ValidationError(
+            f"rect {rect} must lie inside the {width}x{height}-tile map, with w and h above 0"
+        )
+    patch = bool((status.get("unofficial_patch") or {}).get("loaded"))
+    low, high = (
+        (PATCH_MAP_TILES_MIN, PATCH_MAP_TILES_MAX) if patch else (MAP_TILES_MIN, MAP_TILES_MAX)
+    )
+    if not (low <= w <= high and low <= h <= high):
+        raise ValidationError(f"the cropped map must be {low} to {high} tiles on each side")
+    window = cropping.window_woxels((x, y, w, h))
+    found = cropping.classify({kind: _all_elements(kind) for kind in cropping.KINDS}, window)
+    outside = [i for ids in found["outside"].values() for i in ids]
+    levels = list_levels().get("levels", [])
+    preview = {
+        "changed": False,
+        "size_tiles": [w, h],
+        "previous_tiles": [width, height],
+        "content_shift_woxels": [-x * cropping.WOXELS_PER_TILE, -y * cropping.WOXELS_PER_TILE],
+        **found,
+    }
+    if len(levels) > 1:
+        preview["levels_note"] = (
+            "every level is cropped; only the current level is cleaned of what lies outside"
+        )
+    if not confirm:
+        preview["next"] = "show the user this window; with their agreement, call with confirm=true"
+        return preview
+
+    map_file = str(status.get("map_file") or "")
+    if not map_file:
+        return {**preview, "refused": "save the map first (save_map with a filename)"}
+    saved = save_map()
+    if not saved.get("completed"):
+        return {**preview, "refused": "the map did not save, so nothing was cropped", "save": saved}
+    source = Path(map_file)
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    backup = source.with_name(f"{source.stem}.before-crop-{stamp}{source.suffix}")
+    shutil.copy2(source, backup)
+    resized = bridge.request("set_map_size", width=w, height=h, left=-x, top=-y)
+    deleted: list[int] = []
+    for start in range(0, len(outside), BATCH_LIMIT):
+        chunk = outside[start : start + BATCH_LIMIT]
+        delete_elements(chunk)
+        deleted.extend(chunk)
+    reply = {
+        **preview,
+        "changed": True,
+        "backup": str(backup),
+        "resize": resized,
+        "deleted": len(deleted),
+        "undo_steps": -(-len(deleted) // BATCH_LIMIT),
+    }
+    reply.pop("outside")
+    reply["deleted_ids"] = found["outside"]
+    return reply
 
 
 @tool()
@@ -4211,14 +4888,75 @@ def _shown(image: Image, path: str, what: str) -> list[Image | str]:
     ]
 
 
+# Widest view screenshot(tiles_across=) aims for. The Unofficial Patch allows
+# 200-tile maps (500 with a warning), and nothing wider is worth one image.
+MAX_TILES_ACROSS = 500
+
+
+def _aim_camera(
+    rect: list[float] | None, center: list[float] | None, tiles_across: float | None
+) -> dict | None:
+    """Point the camera where a screenshot asked to look, through set_camera.
+
+    set_camera is the only zoom path the Unofficial Patch leaves alone, and the
+    bridge refuses it while an export renders, which is what keeps an aimed
+    screenshot from corrupting one. Returns the camera it left, or None when
+    nothing was asked for.
+    """
+    if rect is None and center is None and tiles_across is None:
+        return None
+    if rect is not None and (center is not None or tiles_across is not None):
+        raise ValidationError("pass rect, or center and tiles_across, not both")
+    for value in [*(rect or []), *(center or []), tiles_across]:
+        if value is not None:
+            require_finite(value, "screenshot framing")
+    viewport = bridge.request("get_camera").get("viewport_size") or [0, 0]
+    width, height = (max(float(side), 1.0) for side in viewport)
+    params: dict[str, float] = {}
+    if rect is not None:
+        x, y, w, h = rect
+        require_positive(w, "rect width")
+        require_positive(h, "rect height")
+        params = {"x": x + w / 2, "y": y + h / 2, "zoom": max(w / width, h / height)}
+    else:
+        if center is not None:
+            params["x"], params["y"] = center
+        if tiles_across is not None:
+            params["zoom"] = tiles_across * WOXELS_PER_TILE / width
+    return bridge.request("set_camera", **params)
+
+
 @tool()
-def screenshot(max_px: int | None = None) -> list[Image | str]:
+def screenshot(
+    max_px: int | None = None,
+    rect: Annotated[
+        list[float] | None,
+        Field(
+            min_length=4,
+            max_length=4,
+            description="[x, y, w, h] in woxels to frame before the capture.",
+        ),
+    ] = None,
+    center: Annotated[
+        list[float] | None,
+        Field(min_length=2, max_length=2, description="[x, y] in woxels to center on."),
+    ] = None,
+    tiles_across: Annotated[
+        float | None,
+        Field(gt=0, le=MAX_TILES_ACROSS, description="Tiles the view spans left to right."),
+    ] = None,
+) -> list[Image | str]:
     """Capture the current Dungeondraft window (the on-screen view) and return it as an image.
 
     Fast; shows exactly what's visible including the current camera framing —
     so AIM FIRST, or you photograph whatever the last call left on screen:
     focus_element(id) for one thing, fit_elements() for the whole map. For a
     clean full-map render without UI, use export_map.
+
+    Or aim in the same call: rect=[x, y, w, h] frames that area (woxels; the
+    longer side fits), or center=[x, y] with tiles_across=N looks at N tiles
+    of width around a point. Either alone keeps the other's current value.
+    The camera stays there afterwards.
 
     max_px: shrink the image's long edge to this before returning it. Omit for
       the full capture. Worth setting when you are checking placement or
@@ -4230,14 +4968,21 @@ def screenshot(max_px: int | None = None) -> list[Image | str]:
     path. Captures are kept until newer ones replace them (20 by default).
     """
     _require_max_px(max_px)
+    aimed = _aim_camera(rect, center, tiles_across)
     name = f"screenshot-{uuid4().hex}.png"
     res = bridge.request("screenshot", name=name)
     path = _capture_path(res.get("path"), name)
     data = _wait_for_file(path)
     _prune_captures()
-    return _shown(
+    shown = _shown(
         Image(data=_downscale(data, max_px, "png"), format="png"), str(path), "Screenshot"
     )
+    if aimed is not None:
+        shown.append(
+            f"Camera: center {aimed.get('position')}, zoom {aimed.get('zoom')}, "
+            f"viewport {aimed.get('viewport_size')}."
+        )
+    return shown
 
 
 @tool()
@@ -4713,7 +5458,10 @@ def inspect_dungeondraft_installation(live: bool = False) -> dict:
 
 @tool()
 def install_dungeondraft_bridge(
-    mods_dir: str = "", confirm: bool = False, replace: bool = False
+    mods_dir: str = "",
+    confirm: bool = False,
+    replace: bool = False,
+    move_other_copies: bool = False,
 ) -> dict:
     """Install or update the bundled bridge mod in Dungeondraft's mods folder.
 
@@ -4727,6 +5475,13 @@ def install_dungeondraft_bridge(
     3. Once the user agrees, call again with confirm=true, and replace=true
        if a bridge is already there. The old one is moved to a backup outside
        the mods folder, never deleted.
+
+    `other_copies` are further bridges in that folder under other names (an
+    older install, a fork with the same mod id); Dungeondraft would load
+    them too. With the user's agreement, add move_other_copies=true and each
+    is backed up beside the replaced one (`other_copy_backups` in the
+    preview), never deleted and never inside the mods folder. Do not move
+    them by hand.
 
     It never starts Dungeondraft or changes a map. The user must then fully
     quit and reopen Dungeondraft and open a map; ping's `bridge_current`
@@ -4752,6 +5507,14 @@ def install_dungeondraft_bridge(
     }
     if plan.other_copies:
         preview["other_copies"] = [str(path) for path in plan.other_copies]
+        preview["other_copy_backups"] = {
+            str(original): str(backup) for original, backup in installer.other_copy_backups(plan)
+        }
+        if not move_other_copies:
+            preview["other_copies_note"] = (
+                "Dungeondraft would load these too; with the user's agreement, pass "
+                "move_other_copies=true to back each up outside the mods folder"
+            )
     if plan.requires_force:
         preview["note"] = (
             "a bridge is already installed here; with the user's agreement, call "
@@ -4763,10 +5526,10 @@ def install_dungeondraft_bridge(
         return {**preview, "conflict": "a bridge is already installed; pass replace=true"}
 
     try:
-        result = installer.apply_install(plan, force=replace)
+        result = installer.apply_install(plan, force=replace, move_other_copies=move_other_copies)
     except installer.InstallConflictError as exc:
         return {**preview, "conflict": str(exc)}
-    return {
+    reply = {
         "changed": result.changed,
         "destination": str(result.destination),
         "backup_destination": (
@@ -4774,6 +5537,14 @@ def install_dungeondraft_bridge(
         ),
         "next": "fully quit and reopen Dungeondraft, open a map, then call ping",
     }
+    if result.moved_copies:
+        reply["moved_copies"] = {
+            str(original): str(backup) for original, backup in result.moved_copies
+        }
+    elif plan.other_copies:
+        reply["other_copies"] = preview["other_copies"]
+        reply["other_copies_note"] = preview.get("other_copies_note")
+    return reply
 
 
 def main() -> None:

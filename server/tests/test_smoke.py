@@ -75,12 +75,12 @@ def test_list_assets_can_request_only_vanilla_assets(monkeypatch):
 
     monkeypatch.setattr(server.bridge, "request", request)
 
-    assert server.list_assets("Objects", "carpet", 200, vanilla_only=True) == {"assets": []}
+    assert server.list_assets("Objects", "chair", 200, vanilla_only=True) == {"assets": []}
     assert seen == {
         "command": "list_assets",
         "params": {
             "category": "Objects",
-            "search": "carpet",
+            "search": "chair",
             "limit": 200,
             "vanilla_only": True,
         },
@@ -209,6 +209,10 @@ def test_verify_live_covers_every_tool_that_can_be_checked_live():
         # they do not belong in a live map mutation verification.
         "inspect_dungeondraft_installation",
         "install_dungeondraft_bridge",
+        # Resizes and deletes, then writes a backup beside the map file. Its
+        # classification has unit tests (test_cropping); the UAT crop group
+        # runs it on a throwaway map.
+        "crop_map",
         "prepare_map_with_packs",
         # Server-side wait that sends only get_operation, which is exercised
         # here; its polling, failure and timeout paths have unit tests.
@@ -231,6 +235,7 @@ def test_verify_live_covers_every_tool_that_can_be_checked_live():
         # Reads map files from disk and sends no bridge command at all.
         # Covered with synthetic maps in test_mapfile.
         "inspect_map_file",
+        "arrange_objects",
     }
     missing = tools - covered - cannot_check
     assert not missing, (

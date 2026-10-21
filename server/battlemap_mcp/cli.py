@@ -32,6 +32,11 @@ def build_parser() -> argparse.ArgumentParser:
     install.add_argument("--server-executable", type=Path, help="durable MCP server launcher")
     install.add_argument("--dry-run", action="store_true")
     install.add_argument("--force", action="store_true")
+    install.add_argument(
+        "--move-other-copies",
+        action="store_true",
+        help="back up other Battlemap MCP Bridge copies in the mods folder, outside it",
+    )
     install.add_argument("--yes", action="store_true")
     install.add_argument("--client", choices=("claude-code", "codex", "none"), default="none")
 
@@ -153,6 +158,9 @@ def dispatch_installer(args: argparse.Namespace) -> int:
     )
     for action in plan.actions:
         print(action)
+    for original, backup in installer.other_copy_backups(plan):
+        verb = "move" if args.move_other_copies else "with --move-other-copies, move"
+        print(f"{verb} {original} to {backup}")
     print(f"destination: {plan.destination}")
     print(f"runtime state: {state_paths.state_dir()}")
     configured = installer.configured_mods_dir(installer.dungeondraft_data_dir() / "config.ini")
@@ -181,7 +189,9 @@ def dispatch_installer(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        result = installer.apply_install(plan, force=args.force)
+        result = installer.apply_install(
+            plan, force=args.force, move_other_copies=args.move_other_copies
+        )
     except installer.InstallConflictError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -195,6 +205,8 @@ def dispatch_installer(args: argparse.Namespace) -> int:
         return 1
 
     print(f"installed: {result.destination}")
+    for original, backup in result.moved_copies:
+        print(f"moved: {original} -> {backup}")
     if skills_plan is not None:
         try:
             skills = installer.apply_codex_skills_install(skills_plan, force=args.force)

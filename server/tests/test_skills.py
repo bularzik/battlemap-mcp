@@ -954,10 +954,13 @@ def test_the_build_loop_requires_supporting_props_in_the_same_pass():
 def test_environments_scales_vegetation_from_its_texture_size():
     """Stated as a principle with no asset names or counts: these skills ship to
     users whose installed library is nothing like the one this was measured on.
+    Since 1.4 the size is the DRAWN one: pack trees often fill under half
+    their canvas, so a canvas-sized scale makes them come out small.
     """
     prose = _prose("skills/battlemap-environments/SKILL.md")
     assert "texture_size" in prose
-    assert "desired_tiles * 256 / texture_px" in prose
+    assert "`drawn`" in prose
+    assert "desired_tiles * 256 / drawn_px" in prose
     assert "Never assume a family shares a size" in prose
 
 

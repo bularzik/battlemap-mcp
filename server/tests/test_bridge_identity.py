@@ -4,6 +4,7 @@ loaded, so it hashes the source it was compiled from and the server compares.
 """
 
 import hashlib
+import json
 from pathlib import Path
 
 from battlemap_mcp import installer, server
@@ -45,3 +46,35 @@ def test_a_bridge_too_old_to_say_is_unknown_not_stale(monkeypatch):
     """Not knowing and knowing it is stale are different answers."""
     monkeypatch.setattr(server.bridge, "request", lambda cmd, **p: {"pong": True, "protocol": 23})
     assert server.ping()["bridge_current"] is None
+
+
+def test_ping_names_both_versions_when_they_agree(monkeypatch):
+    """Runtime behavior and validation."""
+    reply = {"pong": True, "protocol": 25, "bridge_version": server.__version__}
+    monkeypatch.setattr(server.bridge, "request", lambda cmd, **p: dict(reply))
+    result = server.ping()
+    assert result["bridge_version"] == result["companion_version"] == server.__version__
+    assert "version_note" not in result
+
+
+def test_ping_names_a_version_mismatch(monkeypatch):
+    reply = {"pong": True, "protocol": 25, "bridge_version": "0.9.0"}
+    monkeypatch.setattr(server.bridge, "request", lambda cmd, **p: dict(reply))
+    result = server.ping()
+    assert "0.9.0" in result["version_note"]
+    assert server.__version__ in result["version_note"]
+
+
+def test_an_old_bridge_reports_no_version_and_no_mismatch(monkeypatch):
+    for reply in ({"pong": True, "protocol": 25}, {"pong": True, "bridge_version": ""}):
+        monkeypatch.setattr(server.bridge, "request", lambda cmd, r=reply, **p: dict(r))
+        result = server.ping()
+        assert "bridge_version" not in result
+        assert "version_note" not in result
+        assert result["companion_version"] == server.__version__
+
+
+def test_the_shipped_bridge_manifest_carries_the_companion_version():
+    """The mod reports its .ddmod version, so a release must keep the two equal."""
+    manifest = Path(str(installer.payload_root())) / "mcp_bridge.ddmod"
+    assert json.loads(manifest.read_text())["version"] == server.__version__

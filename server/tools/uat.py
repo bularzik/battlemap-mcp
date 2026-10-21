@@ -2917,8 +2917,7 @@ def material(u: Uat) -> None:
         x, y = u.cx + 1024, u.cy + 1536
         before = render()
         depth = u.c.request("get_status")["undo_depth"]
-        # The default layer: a stroke on -300 showed in the editor but not in an
-        # export (2026-10-11, not yet understood), which is its own question.
+        # The default layer. Which layers draw over a floor is its own case.
         server.paint_material([[x, y]], assets[0], size=2)
         assert u.c.request("get_status")["undo_depth"] == depth + 1, "the stroke is not in history"
         painted = render()
@@ -2936,6 +2935,121 @@ def material(u: Uat) -> None:
     u.check(
         "material: a stroke lands where painted and undo removes it",
         lands_where_painted_and_undoes,
+        needs_dirty=True,
+    )
+
+    def low_layers_draw_under_a_floor():
+        from PIL import Image, ImageChops
+
+        materials = u.c.request("list_assets", category="Materials", search="acid", limit=1)
+        if not materials["assets"]:
+            return "skipped: no acid material in this map's library"
+        asset = materials["assets"][0]
+        asset = asset if isinstance(asset, str) else asset["path"]
+        under, over = (u.cx - 1024, u.cy - 2048), (u.cx + 1024, u.cy - 2048)
+        server.checkpoint("material_floor")
+        try:
+            server.add_floor(rect=[u.cx - 2048, u.cy - 3072, 4096, 2048])
+            before = render()
+            server.paint_material([list(under)], asset, size=2, layer=-300)
+            server.paint_material([list(over)], asset, size=2, layer=-200)
+            after = render()
+        finally:
+            server.rollback_checkpoint("material_floor")
+
+        def changed(point):
+            px, py = int(point[0] * ppi / 256), int(point[1] * ppi / 256)
+            box = (px - 8, py - 8, px + 8, py + 8)
+            with Image.open(before) as b, Image.open(after) as a:
+                diff = ImageChops.difference(b.convert("RGB").crop(box), a.convert("RGB").crop(box))
+            return sum(1 for v in diff.convert("L").getdata() if v > 30)
+
+        hidden, shown = changed(under), changed(over)
+        assert hidden == 0, f"a -300 stroke showed through a floor ({hidden} px changed)"
+        assert shown > 50, f"a -200 stroke did not show on a floor ({shown} px changed)"
+        return f"on a floor: -300 changed {hidden} px, -200 changed {shown} px"
+
+    u.check(
+        "material: -300 draws under a floor and -200 over it",
+        low_layers_draw_under_a_floor,
+        needs_dirty=True,
+    )
+
+
+@group("crop")
+def crop(u: Uat) -> None:
+    """Runtime behavior and validation."""
+    import importlib
+
+    server = importlib.import_module("battlemap_mcp.server")
+    T = 256
+
+    def slot_weight(slot: int, x: float, y: float) -> float:
+        cells = u.c.request("get_terrain", rect=[x - 64, y - 64, 128, 128], samples=2)["weights"]
+        return sum(c[slot] for row in cells for c in row) / 4
+
+    def gone(ident: int) -> bool:
+        try:
+            u.c.request("get_element", id=ident)
+        except BridgeCommandError:
+            return True
+        return False
+
+    def trims_every_side_and_keeps_the_window():
+        assert u.wait_for_save(), "a save was still running"
+        size = u.c.request("get_status")["map_size_woxels"]
+        w, h = int(size[0] // T), int(size[1] // T)
+        # Grow right and bottom, then crop the same amount off the left and
+        # top: the map ends the size it started, with everything moved.
+        u.c.request("set_map_size", width=w + 4, height=h + 3)
+        obj = u.asset("Objects", "barrel") or u.asset("Objects")
+        wall_asset = u.asset("Walls")
+        door = u.asset("Portals", "door") or u.asset("Portals")
+        kept = u.c.request("place_object", asset=obj, x=6 * T, y=5 * T)["id"]
+        dropped = u.c.request("place_object", asset=obj, x=1.5 * T, y=1.5 * T)["id"]
+        crossing = server.draw_wall([[2 * T, 6 * T], [9 * T, 6 * T]], asset=wall_asset, type=1)[
+            "id"
+        ]
+        off = server.draw_wall([[0.5 * T, T], [3 * T, T]], asset=wall_asset, type=1)["id"]
+        portal = server.add_portal(door, 1.75 * T, T)["id"]
+        # The last columns and rows of the window: vanilla cut the splat from
+        # the old top-left, and paint here was lost.
+        dab = ((w + 2.5) * T, (h + 1.5) * T)
+        u.c.request("paint_terrain", slot=1, x=dab[0], y=dab[1], radius=200, rate=1)
+        painted = slot_weight(1, *dab)
+        assert painted > 0.5, f"the dab did not paint: {painted}"
+        preview = server.crop_map([4, 3, w, h])
+        assert preview["changed"] is False, preview
+        assert dropped in preview["outside"].get("objects", []), preview["outside"]
+        assert off in preview["outside"].get("walls", []), preview["outside"]
+        assert portal not in preview["outside"].get("portals", []), (
+            "the door is listed apart from its wall"
+        )
+        assert crossing in preview["crossing"].get("walls", []), preview["crossing"]
+        assert not gone(dropped), "the preview changed the map"
+        done = server.crop_map([4, 3, w, h], confirm=True)
+        u.made_file(done["backup"])
+        assert done["resize"]["history_cleared"] is True, done["resize"]
+        assert u.c.request("get_status")["map_size_woxels"] == size, "not back to the start size"
+        moved = u.c.request("get_element", id=kept)["position"]
+        assert moved == [2 * T, 2 * T], f"the kept object is at {moved}, expected [512, 512]"
+        assert gone(dropped) and gone(off) and gone(portal), "something outside survived"
+        points = u.c.request("get_element", id=crossing)["points"]
+        assert points[0] == [-2 * T, 3 * T], f"the crossing wall did not move: {points}"
+        after = slot_weight(1, dab[0] - 4 * T, dab[1] - 3 * T)
+        assert abs(after - painted) < 0.1, f"terrain at the window's edge: {painted} -> {after}"
+        undone = server.undo()
+        assert undone.get("kind") == "delete_many" and not gone(dropped), undone
+        u.c.request("delete_elements", ids=[kept, crossing, dropped, off])
+        return (
+            f"{w + 4}x{h + 3} -> {w}x{h}: moved by (-1024, -768), {done['deleted']} outside "
+            "deleted in one "
+            f"undo step, crossing wall kept, edge terrain {painted:.2f} -> {after:.2f}"
+        )
+
+    u.check(
+        "crop: a top-left crop moves everything, keeps edge terrain and drops what is outside",
+        trims_every_side_and_keeps_the_window,
         needs_dirty=True,
     )
 
@@ -3032,6 +3146,224 @@ def packs_and_exports(u: Uat) -> None:
         return f"previewed {len(paths)} from {pack['id']}; placement refused"
 
     u.check("assets: a pack the map lacks previews but does not place", preview_unincluded_pack)
+
+
+@group("lights")
+def lights(u: Uat) -> None:
+    """A light with its object, a batch of lights, and light edits: one undo step each."""
+
+    def counts():
+        status = u.c.request("get_status")
+        return status["counts"], status["undo_depth"]
+
+    def object_and_light_are_one_step():
+        asset = u.asset("Objects", "lantern") or u.asset("Objects")
+        (before, depth) = counts()
+        made = u.c.request(
+            "place_object",
+            asset=asset,
+            x=u.cx + 2048,
+            y=u.cy + 1536,
+            light={"color": "#ffcc88", "energy": 1.5, "range": 1.5},
+        )
+        light = u.c.request("get_element", id=made["light_id"])
+        assert light["kind"] == "light" and light["position"] == made["position"], light
+        assert light["color"] == "#ffcc88" and light["energy"] == 1.5, light
+        (after, after_depth) = counts()
+        assert after["objects"] == before["objects"] + 1, after
+        assert after["lights"] == before["lights"] + 1, after
+        assert after_depth == depth + 1, f"object and light took {after_depth - depth} steps"
+        u.c.request("undo")
+        time.sleep(0.3)
+        assert counts()[0] == before, "undo left the object or its light behind"
+        u.c.request("redo")
+        time.sleep(0.3)
+        assert counts()[0] == after, "redo did not restore both"
+        u.c.request("delete_elements", ids=[made["id"], made["light_id"]])
+        return f"object {made['id']} and light {made['light_id']}: one undo step"
+
+    u.check(
+        "lights: place_object(light=) is one undo step",
+        object_and_light_are_one_step,
+        needs_dirty=True,
+    )
+
+    def batch_lights_are_one_step():
+        (before, depth) = counts()
+        made = u.c.request(
+            "add_light",
+            lights=[
+                {"x": u.cx - 512 + i * 512, "y": u.cy + 1792, "energy": 1.0, "range": 1.0}
+                for i in range(3)
+            ],
+        )
+        assert made["added"] == 3 and len(made["ids"]) == 3, made
+        (after, after_depth) = counts()
+        assert after["lights"] == before["lights"] + 3 and after_depth == depth + 1, (after, depth)
+        u.c.request("undo")
+        time.sleep(0.3)
+        assert counts()[0]["lights"] == before["lights"], "undo left lights of the batch"
+        try:
+            u.c.request("add_light", lights=[{"x": 0, "y": 0}, {"x": 1, "y": 1, "color": "nope"}])
+        except BridgeCommandError as refused:
+            assert "lights[1]" in str(refused), refused
+        else:
+            raise AssertionError("a bad colour in a light batch was accepted")
+        assert counts()[0]["lights"] == before["lights"], "a refused batch added lights"
+        return "3 lights in 1 step; a bad entry added none"
+
+    u.check(
+        "lights: add_light(lights=) is one undo step", batch_lights_are_one_step, needs_dirty=True
+    )
+
+    def light_edits_and_default_colour():
+        made = u.c.request("add_light", x=u.cx, y=u.cy + 2048)
+        light = u.c.request("get_element", id=made["id"])
+        assert light["color"] == "#ffe6b2", light
+        changed = u.c.request(
+            "modify_object", id=made["id"], color="#00ff00", energy=0.5, range=2.0, shadows=False
+        )
+        assert (changed["color"], changed["energy"], changed["range"], changed["shadows"]) == (
+            "#00ff00",
+            0.5,
+            2.0,
+            False,
+        ), changed
+        u.c.request("undo")
+        time.sleep(0.3)
+        back = u.c.request("get_element", id=made["id"])
+        assert (back["color"], back["energy"], back["shadows"]) == ("#ffe6b2", 1, True), back
+        try:
+            u.c.request("modify_object", id=made["id"], scale=2.0)
+        except BridgeCommandError:
+            pass
+        else:
+            raise AssertionError("scale on a light was accepted")
+        u.c.request("delete_element", id=made["id"])
+        return "default #ffe6b2; colour, energy, range and shadows edit and undo"
+
+    u.check(
+        "lights: modify_object edits a light; default colour matches the map file",
+        light_edits_and_default_colour,
+        needs_dirty=True,
+    )
+
+
+@group("scatter_keep_out")
+def scatter_keep_out(u: Uat) -> None:
+    """scatter_objects keeps drawn art off walls and out of avoid_rects."""
+
+    room = [u.cx - 1024, u.cy - 1024, 2048, 2048]
+    margin = 32
+
+    def wide_assets():
+        found = u.c.request("list_assets", category="Objects", search="tree", limit=3)
+        return found.get("assets") or [u.asset("Objects")]
+
+    def bounds_of(ids):
+        # The server derives opaque_bounds from what the bridge reports.
+        from battlemap_mcp.placement import add_bounds
+
+        return [add_bounds(u.c.request("get_element", id=i))["opaque_bounds"] for i in ids]
+
+    def art_stays_off_the_walls():
+        x, y, w, h = room
+        wall = u.c.request(
+            "draw_wall", points=[[x, y], [x + w, y], [x + w, y + h], [x, y + h]], loop=True
+        )
+        try:
+            assets = wide_assets()
+            loose = u.c.request("scatter_objects", assets=assets, rect=room, count=30, seed=7)
+            crossing = [
+                b
+                for b in bounds_of(loose["ids"])
+                if b[0] < x or b[1] < y or b[2] > x + w or b[3] > y + h
+            ]
+            u.c.request("undo")
+            kept = u.c.request(
+                "scatter_objects", assets=assets, rect=room, count=30, seed=7, wall_margin=margin
+            )
+            bad = [
+                b
+                for b in bounds_of(kept["ids"])
+                if b[0] < x + margin - 1
+                or b[1] < y + margin - 1
+                or b[2] > x + w - margin + 1
+                or b[3] > y + h - margin + 1
+            ]
+            u.c.request("undo")
+        finally:
+            u.c.request("delete_element", id=wall["id"])
+        assert crossing, "without wall_margin nothing crossed the wall: the case proves nothing"
+        assert kept["placed"] > 0 and kept["kept_out"] > 0, kept
+        assert not bad, f"{len(bad)} object(s) reached within {margin} of the wall: {bad[:3]}"
+        return (
+            f"{len(crossing)} crossed the wall without it; with wall_margin "
+            f"{kept['placed']} placed, {kept['kept_out']} kept out, none within {margin}"
+        )
+
+    u.check(
+        "scatter: wall_margin keeps drawn art off the walls",
+        art_stays_off_the_walls,
+        needs_dirty=True,
+    )
+
+    def art_stays_out_of_avoid_rects():
+        x, y, w, h = room
+        hole = [x + 640, y + 640, 768, 768]
+        hx0, hy0, hx1, hy1 = hole[0], hole[1], hole[0] + hole[2], hole[1] + hole[3]
+        made = u.c.request(
+            "scatter_objects",
+            assets=wide_assets(),
+            rect=room,
+            count=40,
+            seed=11,
+            avoid_rects=[hole],
+        )
+        bad = []
+        for b in bounds_of(made["ids"]):
+            cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+            # An axis-aligned box of rotated art spans no more than its reach
+            # along an axis, so a centre level with the hole must clear it.
+            if hx0 <= cx <= hx1 and b[1] < hy1 - 1 and b[3] > hy0 + 1:
+                bad.append(b)
+            elif hy0 <= cy <= hy1 and b[0] < hx1 - 1 and b[2] > hx0 + 1:
+                bad.append(b)
+        u.c.request("undo")
+        assert made["placed"] > 0 and made["kept_out"] > 0, made
+        assert not bad, f"{len(bad)} object(s) reached into the avoid_rect: {bad[:3]}"
+        return f"{made['placed']} placed, {made['kept_out']} kept out of the rect"
+
+    u.check(
+        "scatter: avoid_rects keeps drawn art out", art_stays_out_of_avoid_rects, needs_dirty=True
+    )
+
+
+@group("preview_scale")
+def preview_scale(u: Uat) -> None:
+    """preview_assets returns sizes as data, and true_scale shares one factor."""
+
+    def sizes_come_back():
+        found = u.c.request("list_assets", category="Objects", search="", limit=40)["assets"]
+        picks = found[:4]
+        fitted = u.c.request(
+            "preview_assets", category="Objects", assets=picks, name="asset_preview.png"
+        )
+        scaled = u.c.request(
+            "preview_assets",
+            category="Objects",
+            assets=picks,
+            true_scale=True,
+            name="asset_preview.png",
+        )
+        sizes = scaled["sizes"]
+        assert all(isinstance(size, list) and len(size) == 2 for size in sizes), sizes
+        assert all(isinstance(d, list) and len(d) == 4 for d in scaled["drawn"]), scaled["drawn"]
+        assert scaled["woxels_per_cell"] == max(max(size) for size in sizes), scaled
+        assert "woxels_per_cell" not in fitted and fitted["sizes"] == sizes, fitted
+        return f"sizes {sizes}, one cell spans {scaled['woxels_per_cell']} woxels"
+
+    u.check("preview: sizes as data; true_scale reports woxels_per_cell", sizes_come_back)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -115,7 +115,7 @@ def test_a_genuine_capture_is_returned(root, monkeypatch):
 
     monkeypatch.setattr(server.bridge, "request", request)
     assert server.screenshot()[0].data == data
-    assert server.preview_assets(["textures/objects/x.png"]).data == data
+    assert server.preview_assets(["textures/objects/x.png"])[0].data == data
 
 
 def test_the_root_uses_an_independent_capture_override(tmp_path, monkeypatch):

@@ -4,6 +4,94 @@ What changed in each release, written for the people using it. Versions cover
 the companion, the Dungeondraft mod and the map-making skills together; the
 wire protocol between them is versioned separately and is currently 25.
 
+## 1.4.0 — 2026-10-20
+
+Furnish a room in one step, keep scattered art off walls, place lights with
+their lamps and crop a map from any side. Many of these ideas come from
+@immortalBan's fork, rebuilt here with their blessing: thank you, Ivan.
+
+**Furnish a room in one step: shelves along a wall, chairs around a table,
+books on a desk.** Ask for a row of shelves
+and your assistant backs them flush against the wall, fronts into the room,
+leaving doors and corners clear. Ask for seats and they ring the table, each
+facing it, a touch irregular so the table doesn't look stamped out. Ask to
+dress a desk and the items land on top of it, inside its edges, without
+piling on each other. Everything is fitted to what the art actually covers,
+so pack furniture no longer stands a hand's width off its wall. Each
+arrangement is a single undo, and your assistant can preview it before
+placing anything. Where two rooms share a wall, it says which of the two it
+used.
+
+**Asset listings say how big each asset is, and how much of it is drawn.** Your assistant now sees each asset's size
+and the part its art actually covers before placing it. Art from asset packs
+often fills under half of its image, so this is what lets beds, rugs,
+shadows and spacing be fitted to the drawing instead of to empty space,
+without placing a test copy first.
+
+**Scattered trees and clutter stay off walls and out of paths.** `scatter_objects` takes `wall_margin` and
+`avoid_rects`, measured from the part of each asset that is actually drawn,
+so a tree's crown no longer lands over a wall or across a doorway. On a
+128-tile map with 3,000 wall segments, a 500-object scatter takes under
+half a second.
+
+**Lights go in with their lamps, and can be adjusted afterwards.** A lantern, brazier or candle can be placed with
+its light in one step, a whole lighting pass is one undo, and a light's
+colour, brightness, range and shadows can be changed after it is placed.
+Those changes are saved with the map.
+
+**Asset previews can show true relative sizes.** A preview sheet can draw every asset at one scale, so a stool shows
+small beside a table, and the assistant gets each asset's size alongside
+the picture.
+
+**Asset searches can stay inside one pack.** Name a pack this map includes, by its id or its name, and the search
+looks only there. Naming a pack the map does not include is refused with
+the packs you can choose from, rather than coming back empty.
+
+**A search that finds nothing tries words that mean the same thing.** Asking for a rug when the library calls it a
+carpet now finds the carpet, and says that is what it searched. Only true
+equivalents are tried (rug and carpet, armour and armor, bookshelf and
+bookcase): a desk never turns into a table, so a missing piece still shows up
+as missing.
+
+**Screenshots can aim themselves.** Your
+assistant can name an area of the map, or a point and how many tiles across
+to show, and take the screenshot in one step instead of moving the camera
+first.
+
+**The map-making skills check for every named piece before building.** If your brief names something the library does
+not have, you hear about it up front with options, instead of finding a
+lookalike in its place.
+
+**Ask which version you are running.** The connection check now names the
+version of the companion and of the Dungeondraft mod it is talking to, and
+says plainly when the two differ and which one to update.
+
+**Updating the mod tidies away old copies, if you agree.** When the
+installer finds another copy of the bridge in your mods folder, such as an
+older install under a different folder name or a fork that uses the same
+mod id, it shows where each would go and, once you agree, moves each one to
+a backup outside the mods folder, so Dungeondraft loads only one. Nothing is
+deleted. From the command line, `install --move-other-copies` does the same.
+
+**Crop a map from any side.** Ask your assistant to make a 20x20 map a
+15x15 and it proposes which part to keep, shows you what would be removed,
+and on your go-ahead keeps a copy of the file, crops it with Dungeondraft's
+own resize and moves everything to fit. Anything left wholly outside is
+removed in one step you can undo. Walls and paths that cross the new edge
+are kept as they are, and your assistant mentions them. Dungeondraft's own
+trim from the top or left loses terrain paint near the far edges and leaves
+cave borders behind their floor; a crop by your assistant repairs both,
+with or without the Unofficial Patch.
+
+**Material patches inside rooms stay visible.** Your assistant now knows
+that materials painted on the lowest layers sit underneath floors, so on a
+room's floor it paints them on a layer that shows, in Dungeondraft and in
+your exports.
+
+**Light colours read back exactly as Dungeondraft saves them.** A light,
+water or text colour could read one step off the map file (`e6b3` where the
+map says `e6b2`), and a Universal VTT export carried the difference.
+
 ## 1.3.1 — 2026-10-20
 
 Objects that block light now reach your VTT, and the user guide has moved to

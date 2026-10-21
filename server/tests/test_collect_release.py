@@ -160,3 +160,33 @@ def test_an_undated_section_is_refused(tmp_path):
     result, _ = _summary(tmp_path, CHANGELOG.replace("## 0.2.0 — 2026-09-24", "## 0.2.0"))
     assert result.returncode != 0
     assert "has no date" in result.stderr
+
+
+def test_a_credit_in_the_paragraph_body_reaches_the_summary(tmp_path):
+    """1.3.1's thanks to immortalBan sat after its bold lead and was dropped
+    from the release page; it had to be written back in by hand."""
+    credited = CHANGELOG.replace(
+        "**Water keeps its colour.** More.",
+        "**Water keeps its colour.** More detail. Thanks to someone, who\n"
+        "found it (see the issue). Trailing remark.",
+    )
+    result, out = _summary(tmp_path, credited)
+    assert result.returncode == 0, result.stderr
+    assert out.read_text(encoding="utf-8").endswith(
+        "- Resized maps open again.\n"
+        "- Water keeps its colour. Thanks to someone, who found it (see the issue).\n"
+    )
+
+
+def test_a_bold_lead_that_wraps_reaches_the_summary(tmp_path):
+    """1.4.0's first draft lost 8 of its 14 entries, the headline among them:
+    every bold lead that wrapped onto a second line was skipped."""
+    wrapped = CHANGELOG.replace(
+        "**Water keeps its colour.** More.",
+        "**Water keeps its colour, even\nafter a reopen.** More.",
+    )
+    result, out = _summary(tmp_path, wrapped)
+    assert result.returncode == 0, result.stderr
+    assert out.read_text(encoding="utf-8").endswith(
+        "- Resized maps open again.\n- Water keeps its colour, even after a reopen.\n"
+    )

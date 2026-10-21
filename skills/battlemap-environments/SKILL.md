@@ -15,11 +15,13 @@ shadows fall as broad dark bands that get mistaken for terrain, and bare trunks
 stick out from under them with no crown in sight.
 
 Never assume a family shares a size, and never carry a number over from another
-map: read `texture_size` from `list_assets` or `get_element` for the assets you
-actually chose, decide how many TILES the thing should occupy, and set the
-scale from that:
+map: read `drawn` from `list_assets` (the part of the image the art covers;
+`get_element` reports `opaque_bounds`) for the assets you actually chose,
+decide how many TILES the thing should occupy, and set the scale from that.
+Pack trees often fill well under half their canvas, so sizing from the canvas
+(`sizes`, `texture_size`) makes them come out small:
 
-    scale = desired_tiles * 256 / texture_px
+    scale = desired_tiles * 256 / drawn_px  (the drawn width or height)
 
 Say the intended canopy size in tiles when you plan a treeline. A tree larger
 than the building beside it is a composition error, not a detail.
@@ -265,6 +267,14 @@ the composition reads as natural without becoming visually noisy. Preserve real
 walls, portals and lights wherever the requested map needs VTT behavior.
 Make barriers, openings and lights reinforce the intended route and focal
 hierarchy instead of treating them as isolated decoration.
+
+**Keep crowns off buildings and out of doorways.** `scatter_objects` keeps
+only each object's centre inside `rect`, so a big tree scattered near a wall
+spreads its crown over the roof line or across a door. Pass `wall_margin`
+(woxels kept between each object's drawn art and every wall) and
+`avoid_rects` (`[[x, y, w, h], ...]` for a path, a doorway apron, a
+clearing). The reply's `kept_out` says how many candidates that cost, and
+fewer than `count` are placed if the area runs out.
 
 Group vegetation and debris into clusters of a few, with varied scale and some
 ground texture beneath them. Isolated shrubs at regular intervals read as

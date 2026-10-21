@@ -48,8 +48,10 @@ without making every room equally accented.
    over the table's lip, a candle off the corner of a desk and a tap past the
    end of its tub all read as careless at token zoom. Table-top things stand
    on tables; a table candelabra on the floor is a misplacement, not a choice.
-   `validate_placements` lists what reaches past its surface under
-   `surface_overflow`.
+   `arrange_objects(mode='on_surface', target_id=...)` does this for you: it
+   sets the items inside the surface's drawn top, a little turned, not
+   overlapping, one layer above it. `validate_placements` lists what reaches
+   past its surface under `surface_overflow`.
 6. Mask wall junctions. Where walls meet at a corner or a T-junction the join
    reads as an editing seam rather than construction. A post, pillar or column
    set over the join, on a layer above the walls, turns the seam into structure
@@ -91,13 +93,15 @@ corridor, a dress form mid-floor, or a bed on a rug in the centre of the room
 with its headboard against nothing reads as dropped. A piece you cannot give
 an anchor is a candidate for removal, not for the middle of the floor.
 
-**Seating around a table is a set, not a scatter.** Measure the table with
-`get_element` on its id (`bounds`, after its turn and scale), then derive the chairs from its edges: evenly spaced
-along each long side, the head chairs centred on the ends, one scale for the
-whole set, and one place setting in front of each chair. Chairs placed at
+**Seating around a table is a set, not a scatter.** Seat it with
+`arrange_objects(mode='around', target_id=<table>, assets=[<chair>],
+count=...)`: it measures the table's drawn edge, spaces the chairs along each
+side (or round a round table), turns each to face it and keeps the jitter to
+a degree or two. Pass `dry_run=true` first if you want to see the positions.
+Then put one place setting in front of each chair. Chairs placed by hand at
 "about" the edge come out uneven in spacing and in size, and a long table
-shows it at once. Keep the variation small here: a degree or two of turn, not
-a different size per chair.
+shows it at once; if you do place them by hand, derive them from
+`get_element`'s `opaque_bounds` and use one scale for the whole set.
 
 **A lived-in room is furnished in layers.** Write each room's layers into the
 plan and check each is present before calling the room done:
@@ -233,16 +237,28 @@ Add to this list as you find others; a wrong facing passes every footprint
 check.
 
 **Hug the wall; do not approach it.** Being flush matters as much as facing.
-Compute the position from the wall's own coordinate, not from "near the
-wall": the wall line plus or minus half the asset's depth along the wall's
-normal, with the depth from `texture_size` times scale. Portraits, rails,
-benches, banners and lanterns half a tile out read as floating. Then read
-`adrift_fixtures` in `validate_placements`, which reports wall fixtures —
-torches, hangings, curtains, chimneys, windows and `Wall_` pieces — standing
-off every wall.
+For a run of shelves, cabinets, benches or barrels, use
+`arrange_objects(mode='along_wall', along=[[x0, y0], [x1, y1]], toward=<a
+point in the room>, assets=[...])`. It backs each piece against the wall by
+its drawn depth, faces it into the room, and keeps doors, windows and corners
+clear. It reports which wall it used. If `warnings` names a second wall just
+as close, the room shares a double wall with its neighbour: pass the
+`wall_id` you meant. For a single piece, compute the position from the wall's
+own coordinate, not from "near the wall": the wall line plus or minus half the
+asset's depth along the wall's normal, with the depth from `list_assets`'
+`drawn` times scale. Pack art rarely fills its canvas, so a canvas depth leaves
+a gap. Portraits, rails, benches, banners and lanterns half a tile out read as
+floating. Then read `adrift_fixtures` in `validate_placements`, which reports
+wall fixtures — torches, hangings, curtains, chimneys, windows and `Wall_`
+pieces — standing off every wall.
 
 `preview_assets` renders every candidate at rotation 0, so what sits at the
 bottom of the cell is what will face the room when you place it unrotated.
+Pass `true_scale=true` to draw every candidate at one scale, so a stool shows
+small beside a table and you can see what will crowd the room before placing
+it. `arrange_objects` assumes the front is at the bottom too (`facing`
+changes that). Check the facing table above before you line a wall with a
+piece drawn side-on.
 
 The asset's **silhouette** tells you where it was drawn to go. A hearth with a
 semicircular mouth was made for a curved nook and will leave an awkward crescent
@@ -254,8 +270,11 @@ shape wants — but do not force a fixture into a wall it was never drawn for.
 
 Use the [lighting hierarchy](../battlemap-lighting-hierarchy/SKILL.md) with
 `add_light` to reveal the focal point, guide circulation and let secondary
-areas fall quieter rather than making every area equally bright. Treat
-incidental scatter as background texture, never as the room’s main story.
+areas fall quieter rather than making every area equally bright. A lamp,
+candle or brazier takes its light in the same call: `place_object(light=...)`,
+or a `light` on its `place_objects` entry, so the two are undone together and
+the light sits on its source. Treat incidental scatter as background texture,
+never as the room’s main story.
 Treat doors, barriers and lights as one route system: each should confirm how
 a player enters, moves through and reads the room.
 

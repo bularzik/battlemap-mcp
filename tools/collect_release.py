@@ -6,7 +6,8 @@ to the draft release by hand, with SHA256SUMS regenerated then.
 
 `--changelog` with `--summary-out` also writes a short "What's new" for the
 release page from this version's CHANGELOG.md section: its opening line and
-one bullet per bold lead. The file goes outside the asset directory, so it
+one bullet per bold lead, plus any sentence of its paragraph that thanks
+someone, so a contributor's credit is never dropped. The file goes outside the asset directory, so it
 is never uploaded as a download.
 """
 
@@ -58,6 +59,12 @@ def collect(
     )
 
 
+def _credits(body: str) -> list[str]:
+    """The sentences of `body` that thank someone."""
+    sentences = re.split(r"(?<=[.!?])\s+", " ".join(body.split()))
+    return [s for s in sentences if re.match(r"(?:Thanks|Thank you)\b", s)]
+
+
 def summary(changelog: str, version: str) -> str:
     """The release page's "What's new" for `version`, from its CHANGELOG section.
 
@@ -78,10 +85,14 @@ def summary(changelog: str, version: str) -> str:
     section = body[: following.start()] if following else body
     paragraphs = [p.strip() for p in section.strip().split("\n\n") if p.strip()]
     intro = [p for p in paragraphs if not p.startswith("**")][:1]
+    # A credit in the paragraph body rides along with its lead: 1.3.1's thanks
+    # to the person who found and fixed its bug was dropped otherwise.
+    # A lead may wrap: 1.4.0's first draft lost 8 of its 14 entries, the
+    # headline among them, because `.` stopped at the line break.
     leads = [
-        m.group(1).strip()
+        " ".join([" ".join(m.group(1).split()), *_credits(p[m.end() :])])
         for p in paragraphs
-        if (m := re.match(r"\*\*(.+?)\*\*", p)) is not None
+        if (m := re.match(r"\*\*(.+?)\*\*", p, re.DOTALL)) is not None
     ]
     if not leads:
         raise ValueError(f"CHANGELOG.md's {version} section has no bold entries")

@@ -58,6 +58,10 @@ const DELETE_CMDS := ["delete_element"]
 const MAX_BATCH_ITEMS := 100
 
 const MAX_FILE_BATCH_ITEMS := 1000
+# scatter_objects' avoid_rects, each checked on every attempt.
+const SCATTER_MAX_AVOID_RECTS := 32
+# The narrowest cell scatter_objects buckets walls into, in woxels.
+const SCATTER_MIN_CELL := 256.0
 const TERRAIN_CMDS := ["fill_terrain", "fill_region", "paint_terrain", "paint_path"]
 const CAVE_CMDS := ["dig_cave", "clear_caves", "set_cave_entrance"]
 
@@ -412,6 +416,7 @@ func _evaluator_port():
 	return port
 
 func start():
+	_bridge_version = _read_bridge_version()
 	_token = _ensure_token()
 	if _token == "":
 		print("[mcp-bridge] FATAL: refusing to listen without a secure token. " +
@@ -771,7 +776,7 @@ func _record_and_dispatch(req : Dictionary) -> Dictionary:
 			slots_before = _terrain_slots(lvl)
 
 	var assign_mark = -1
-	if cmd in COMPOSITE_CMDS:
+	if _composite_cmd(cmd, req):
 		assign_mark = _assign_seq
 
 	var cave_before = null
@@ -860,13 +865,23 @@ func _record_and_dispatch(req : Dictionary) -> Dictionary:
 			"recovers, and it discards unsaved work.") % _save_stale_path
 	return result
 
+# A command that makes several nodes, recorded as one grouped op of everything
+# assigned an id while it ran. A placement with a light and a batch of lights
+# are single-node creates otherwise, whose op would undo only the first node.
+func _composite_cmd(cmd, req : Dictionary) -> bool:
+	if cmd in COMPOSITE_CMDS:
+		return true
+	if cmd == "place_object" and req.get("light", null) != null:
+		return true
+	return cmd == "add_light" and req.has("lights")
+
 # Returns an undo op for a recordable command, or null. Ops are reversed by
 # _apply_op (undo=true) and re-applied (undo=false).
 func _build_op(cmd, req, result, pre, terrain_before, cave_before = null,
 		deleted_node = null, deleted_parent = null, pre_many = null,
 		assign_mark : int = -1, slots_before = null, terrain_before2 = null,
 		deleted_many = null):
-	if cmd in CREATE_CMDS:
+	if cmd in CREATE_CMDS and assign_mark < 0:
 		var id = result["result"].get("id", -1)
 		if id != null and int(id) >= 0:
 			var node = Global.World.GetNodeByID(int(id))
@@ -911,7 +926,7 @@ func _build_op(cmd, req, result, pre, terrain_before, cave_before = null,
 			var cave_lvl = Global.World.GetCurrentLevel()
 			return { "kind": "cave", "level": (int(cave_lvl.ID) if cave_lvl != null else -1),
 				"before": cave_before, "after": after }
-	elif cmd in COMPOSITE_CMDS and assign_mark >= 0:
+	elif assign_mark >= 0:
 
 		var entries := []
 
@@ -1263,6 +1278,11 @@ func _apply_props(node, snap):
 	if snap.get("modulate") != null:
 		# Same best-effort rationale as the colour restore above.
 		_set_node_modulate(node, snap["modulate"])
+	if snap.get("light") != null:
+		node.color = snap["light"]["color"]
+		node.energy = snap["light"]["energy"]
+		node.texture_scale = snap["light"]["range"]
+		node.shadow_enabled = snap["light"]["shadows"]
 
 func _generate_dungeon(req : Dictionary) -> Dictionary:
 	if not Global.Editor.Tools.has("Generator"):
@@ -1713,8 +1733,8 @@ func _recolour_water_node(node : Dictionary, deep, shallow, blend, keep : Dictio
 	# The root is a container with an empty polygon and zeroed colours in every
 	# saved map; it is not a body and is left exactly as Dungeondraft wrote it.
 	if not root and not keep.has(node.get("ref")):
-		if deep != null: node["deep_color"] = deep.to_html(true)
-		if shallow != null: node["shallow_color"] = shallow.to_html(true)
+		if deep != null: node["deep_color"] = _html(deep, true)
+		if shallow != null: node["shallow_color"] = _html(shallow, true)
 		if blend != null: node["blend_distance"] = blend
 		count += 1
 	var children = node.get("children", [])
@@ -1753,8 +1773,8 @@ func _water_style_readback(water) -> Dictionary:
 		styles[str(bodies[ref])] = bodies[ref]
 	if styles.size() == 1:
 		var only = styles.values()[0]
-		out["deep_color"] = "#" + Color(only[0]).to_html(false)
-		out["shallow_color"] = "#" + Color(only[1]).to_html(false)
+		out["deep_color"] = "#" + _html(Color(only[0]), false)
+		out["shallow_color"] = "#" + _html(Color(only[1]), false)
 		out["blend_distance"] = only[2]
 	elif styles.size() > 1:
 		out["mixed_styles"] = styles.size()
@@ -1762,9 +1782,9 @@ func _water_style_readback(water) -> Dictionary:
 		# No water yet: report what the mesh holds, which is what the bridge
 		# will give the next body drawn on this level.
 		var deep = water.get("DeepColor")
-		if deep is Color: out["deep_color"] = "#" + deep.to_html(false)
+		if deep is Color: out["deep_color"] = "#" + _html(deep, false)
 		var shallow = water.get("ShallowColor")
-		if shallow is Color: out["shallow_color"] = "#" + shallow.to_html(false)
+		if shallow is Color: out["shallow_color"] = "#" + _html(shallow, false)
 		var blend_now = water.get("BlendDistance")
 		if blend_now != null: out["blend_distance"] = float(blend_now)
 	var no_border = water.get("disableBorder")
@@ -2122,6 +2142,9 @@ func _snapshot(node) -> Dictionary:
 	var col = _read_node_color(node)
 	if col != null:
 		s["color"] = col
+	if _is_light(node):
+		s["light"] = { "color": node.color, "energy": node.energy,
+			"range": node.texture_scale, "shadows": node.shadow_enabled }
 	return s
 
 # Dispatch with a guard so a bad command can never take down the TCP loop.
@@ -2168,7 +2191,8 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		"ping": return _ok({ "pong": true, "protocol": PROTOCOL_VERSION, "paused": _paused,
 			"engine": Engine.get_version_info(), "bridge_sha256": _bridge_sha256(),
 			"bridge_root": Global.get("Root", ""), "process_id": OS.get_process_id(),
-			"bridge_instance": _instance_id, "unofficial_patch": _patch_info() })
+			"bridge_instance": _instance_id, "unofficial_patch": _patch_info(),
+			"bridge_version": _bridge_version })
 		"get_status": return _get_status()
 		"list_asset_categories": return _list_asset_categories()
 		"list_asset_packs": return _list_asset_packs()
@@ -2541,14 +2565,36 @@ func _preview_assets(req : Dictionary) -> Dictionary:
 
 	var missing := []
 	var colorable := []
+	var textures := []
 	for i in range(assets.size()):
 		var asset = str(assets[i])
 		var tex = _asset_tex(category, asset)
 		if tex == null:
 			tex = _unincluded_pack_texture(asset)
+		textures.append(tex)
+
+	var true_scale = bool(req.get("true_scale", false))
+	var largest = 0
+	for tex in textures:
+		if tex != null:
+			var tsize = _preview_size(category, tex)
+			largest = max(largest, max(tsize.x, tsize.y))
+	var sizes := []
+	var drawn := []
+	for i in range(assets.size()):
+		var asset = str(assets[i])
+		var tex = textures[i]
+		sizes.append(null)
+		drawn.append(null)
 		if tex == null:
 			missing.append(asset)
 			continue
+		var tex_size = tex.get_size()
+		sizes[i] = [int(tex_size.x), int(tex_size.y)]
+		if category == "Objects":
+			var used = _opaque_rect(tex)
+			if used.size() == 4:
+				drawn[i] = used
 		var img = tex.get_data()
 		if img == null:
 			missing.append(asset)
@@ -2573,6 +2619,8 @@ func _preview_assets(req : Dictionary) -> Dictionary:
 		# Fit inside the cell preserving aspect, so a long table is not squashed
 		# into a square and judged on a shape it does not have.
 		var factor = min(float(cell) / float(w), float(cell) / float(h))
+		if true_scale and largest > 0:
+			factor = float(cell) / float(largest)
 		var nw = int(max(1, int(float(w) * factor)))
 		var nh = int(max(1, int(float(h) * factor)))
 		img.resize(nw, nh, Image.INTERPOLATE_BILINEAR)
@@ -2588,9 +2636,22 @@ func _preview_assets(req : Dictionary) -> Dictionary:
 	var err = sheet.save_png(path)
 	if err != OK:
 		return _err("save_png failed (err %d): %s" % [err, path])
-	return _ok({ "path": path, "columns": columns, "rows": rows, "cell_px": cell,
+	var out := { "path": path, "columns": columns, "rows": rows, "cell_px": cell,
 		"count": assets.size(), "colorable": colorable, "missing": missing,
-		"width": sheet.get_width(), "height": sheet.get_height() })
+		"width": sheet.get_width(), "height": sheet.get_height(),
+		"sizes": sizes, "drawn": drawn, "true_scale": true_scale }
+	if true_scale and largest > 0:
+		# Texture pixels are woxels for a prop at scale 1.
+		out["woxels_per_cell"] = int(largest)
+	return _ok(out)
+
+# The pixel size a preview cell shows of this texture: a wall is cropped to a
+# run twice as long as it is thick.
+func _preview_size(category : String, tex) -> Vector2:
+	var size = tex.get_size()
+	if category == "Walls" and size.x > size.y * 2:
+		return Vector2(size.y * 2, size.y)
+	return size
 
 # Wall textures are either greyscale masks the wall tool colours at placement or
 # full-colour pack art. Only a mask wants tinting: multiplying a coloured wall
@@ -2705,16 +2766,30 @@ func _list_assets(req : Dictionary) -> Dictionary:
 			out.append(path)
 
 	var colorable := []
-	if out.size() <= COLORABLE_SCAN_MAX:
+	var sizes := []
+	var drawn := []
+	var scanned = out.size() <= COLORABLE_SCAN_MAX
+	if scanned:
 		for i in range(out.size()):
-			if _mask_fraction(_asset_tex(category, out[i])) > 0.0:
+			var tex = _asset_tex(category, out[i])
+			if _mask_fraction(tex) > 0.0:
 				colorable.append(i)
+			if tex == null:
+				sizes.append([])
+				drawn.append([])
+				continue
+			sizes.append(_vec(tex.get_size()))
+			drawn.append(_opaque_rect(tex))
 
 	return _ok({ "category": category, "total": all.size() - hidden,
 		"total_unfiltered": all.size(), "matched": matched,
 		"returned": out.size(), "assets": out, "colorable": colorable,
 		"hidden_unusable": hidden,
-		"colorable_scanned": out.size() <= COLORABLE_SCAN_MAX,
+		"colorable_scanned": scanned,
+		# [w, h] canvas and [x, y, w, h] drawn rect from its top-left; [] when
+		# the texture could not be read. null when the scan was skipped.
+		"sizes": sizes if scanned else null,
+		"drawn": drawn if scanned else null,
 		"colorable_are": "indices into assets",
 		# Only when it applies. The note was attached to every listing, including
 		# the ones where `colorable` was empty and it said nothing at all.
@@ -2949,7 +3024,7 @@ func _ambient_light():
 		return null
 	var value = env.get("ambient_light")
 	if value is Color:
-		return "#" + value.to_html(false)
+		return "#" + _html(value, false)
 	var text = str(value) if value != null else ""
 	if text.length() == 8 and text.is_valid_hex_number():
 		return "#" + text.substr(2)
@@ -2974,7 +3049,7 @@ func _set_ambient_light(req : Dictionary) -> Dictionary:
 	var got = null
 	if env.has_method("get_AmbientLight"):
 		var c = env.get_AmbientLight()
-		if c is Color: got = "#" + c.to_html(false)
+		if c is Color: got = "#" + _html(c, false)
 	_release_tool(env, env_active)
 	return _ok({ "ambient_light": got })
 
@@ -3436,8 +3511,8 @@ func _get_cave(req : Dictionary) -> Dictionary:
 			if entrances.get_bit(cell): entrance_cells += 1
 	return _ok({ "level_id": level.ID, "bitmap_size": [int(size.x), int(size.y)],
 		"cell_size_woxels": cave.get_CellSize(), "floor_cells": floor_cells,
-		"entrance_cells": entrance_cells, "ground_color": "#" + cave.get_GroundColor().to_html(false),
-		"wall_color": "#" + cave.get_WallColor().to_html(false) })
+		"entrance_cells": entrance_cells, "ground_color": "#" + _html(cave.get_GroundColor(), false),
+		"wall_color": "#" + _html(cave.get_WallColor(), false) })
 
 # A bounded circular blast mask removes cave border art without carving floor.
 func _set_cave_entrance(req : Dictionary) -> Dictionary:
@@ -3815,6 +3890,40 @@ func _delete_level(req : Dictionary) -> Dictionary:
 		"note": "not undoable through this bridge" })
 
 func _place_object(req : Dictionary) -> Dictionary:
+	var light_spec = req.get("light", null)
+	if light_spec == null:
+		return _place_one_object(req)
+	var bad_light = _bad_light_spec(light_spec)
+	if bad_light != "":
+		return _err("light: " + bad_light)
+	var res = _place_one_object(req)
+	if not res.get("ok", false):
+		return res
+	var light_req = light_spec.duplicate()
+	var pos = res["result"]["position"]
+	light_req["x"] = pos[0]
+	light_req["y"] = pos[1]
+	var lit = _add_light(light_req)
+	if not lit.get("ok", false):
+		var removed = _delete_element({ "id": int(res["result"]["id"]) }).get("ok", false)
+		return _err(("the light could not be made (%s); the object %s") % [str(lit.get("error")),
+			"was removed again" if removed else ("(id %d) is still on the map" % int(res["result"]["id"]))])
+	res["result"]["light_id"] = lit["result"]["id"]
+	return res
+
+# Why a light entry cannot be made, or "". Checked before anything is created.
+func _bad_light_spec(spec) -> String:
+	if typeof(spec) != TYPE_DICTIONARY:
+		return "must be an object like {color, energy, range}"
+	var bad = _bad_color(spec, ["color"])
+	if bad != null:
+		return str(bad.get("error"))
+	var asset = str(spec.get("asset", ""))
+	if asset != "" and _asset_tex("Lights", asset) == null:
+		return "'%s' is not a Lights asset; take one from list_assets(category='Lights')" % asset
+	return ""
+
+func _place_one_object(req : Dictionary) -> Dictionary:
 	var tint_error = _refuse_modulate(req)
 	if tint_error != null: return tint_error
 	var bad_place_object = _bad_sorting(req)
@@ -3898,6 +4007,10 @@ func _place_objects(req : Dictionary) -> Dictionary:
 		if verdicts[asset] != "":
 			return _err(("objects[%d]: '%s' %s, so nothing was placed. Take paths " +
 				"from list_assets(category='Objects').") % [i, asset, verdicts[asset]])
+		if item.get("light", null) != null:
+			var bad_light = _bad_light_spec(item["light"])
+			if bad_light != "":
+				return _err("objects[%d].light: %s, so nothing was placed" % [i, bad_light])
 
 	var placed := []
 	for i in range(items.size()):
@@ -3906,8 +4019,9 @@ func _place_objects(req : Dictionary) -> Dictionary:
 			# Roll back, so the batch is all-or-nothing like scatter_objects.
 			var stuck := []
 			for made in placed:
-				if not _delete_element({ "id": int(made["id"]) }).get("ok", false):
-					stuck.append(int(made["id"]))
+				for made_id in [made["id"], made.get("light_id", null)]:
+					if made_id != null and not _delete_element({ "id": int(made_id) }).get("ok", false):
+						stuck.append(int(made_id))
 			if stuck.empty():
 				return _err(("objects[%d] failed after %d placement(s), all of which were " +
 					"removed — nothing remains on the map. Cause: %s")
@@ -3928,6 +4042,8 @@ func _place_objects(req : Dictionary) -> Dictionary:
 				entry["partly_masked"] = true
 		if out.has("layer"):
 			entry["layer"] = out["layer"]
+		if out.has("light_id"):
+			entry["light_id"] = out["light_id"]
 		placed.append(entry)
 
 	var colorable := []
@@ -4110,6 +4226,8 @@ func _draw_path(req : Dictionary) -> Dictionary:
 	return _ok({ "id": _id(path), "point_count": pts.size() })
 
 func _add_light(req : Dictionary) -> Dictionary:
+	if req.has("lights"):
+		return _add_lights(req["lights"])
 	var bad_light_color = _bad_color(req, ["color"])
 	if bad_light_color != null: return bad_light_color
 	var level = Global.World.GetCurrentLevel()
@@ -4124,6 +4242,33 @@ func _add_light(req : Dictionary) -> Dictionary:
 	if tex != null:
 		light.texture = tex
 	return _ok({ "id": _id(light), "position": _vec(light.position) })
+
+func _add_lights(entries) -> Dictionary:
+	if typeof(entries) != TYPE_ARRAY or entries.empty():
+		return _err("'lights' must be a non-empty array of {x, y, ...} entries")
+	if entries.size() > MAX_BATCH_ITEMS:
+		return _err("'lights' is capped at %d per call" % MAX_BATCH_ITEMS)
+	if Global.World.GetCurrentLevel() == null:
+		return _err("no map open")
+	for i in range(entries.size()):
+		var bad = _bad_light_spec(entries[i])
+		if bad != "":
+			return _err("lights[%d]: %s, so no light was added" % [i, bad])
+		if entries[i].has("lights"):
+			return _err("lights[%d] cannot itself hold 'lights'" % i)
+	var made := []
+	for entry in entries:
+		var res = _add_light(entry)
+		if not res.get("ok", false):
+			var stuck := []
+			for made_id in made:
+				if not _delete_element({ "id": int(made_id) }).get("ok", false):
+					stuck.append(int(made_id))
+			return _err("a light failed after %d were added; %s. Cause: %s" % [made.size(),
+				"all were removed" if stuck.empty() else ("ids %s are still on the map" % str(stuck)),
+				str(res.get("error"))])
+		made.append(res["result"]["id"])
+	return _ok({ "added": made.size(), "ids": made, "undoable": true })
 
 func _nearest_wall_segment(level, pos : Vector2):
 	var best = null
@@ -4330,7 +4475,7 @@ func _place_pattern(req : Dictionary) -> Dictionary:
 	var all = shapes.GetShapes()
 	var result := { "shape": kind, "category": category, "shape_count": all.size() }
 	if color is Color:
-		result["color"] = "#" + color.to_html(true)
+		result["color"] = "#" + _html(color, true)
 	if used_default:
 		# Signal we applied the neutral default (no per-texture tint exists for
 		# patterns; pass an explicit `color` for an exact look).
@@ -4387,6 +4532,9 @@ func _scatter_objects(req : Dictionary) -> Dictionary:
 	var rmax = float(req.get("rotation_max", 360.0))
 	var min_gap = float(req.get("min_gap", 0.0))
 	var color = str(req.get("color", ""))
+	var keep_out = _scatter_keep_out(req, level, assets, Rect2(rx, ry, rw, rh), smax)
+	if keep_out.has("error"):
+		return _err(keep_out["error"])
 
 	var rng = RandomNumberGenerator.new()
 	if req.has("seed"):
@@ -4397,6 +4545,7 @@ func _scatter_objects(req : Dictionary) -> Dictionary:
 	var placed := []
 	var points := []
 	var attempts = 0
+	var kept_out = 0
 	var max_attempts = count * 30
 	while placed.size() < count and attempts < max_attempts:
 		attempts += 1
@@ -4410,6 +4559,8 @@ func _scatter_objects(req : Dictionary) -> Dictionary:
 					break
 			if too_close:
 				continue
+		# Drawn in the order they always were, so a seed without keep-outs
+		# still gives the arrangement it gave before they existed.
 		var sub := {
 			"asset": assets[rng.randi_range(0, assets.size() - 1)],
 			"x": px, "y": py,
@@ -4418,6 +4569,10 @@ func _scatter_objects(req : Dictionary) -> Dictionary:
 			"sorting": int(req.get("sorting", 0)),
 			"layer": int(req.get("layer", DEFAULT_OBJECT_LAYER)),
 		}
+		if keep_out["active"] and _scatter_kept_out(keep_out, Vector2(px, py),
+				float(keep_out["reach"][sub["asset"]]) * float(sub["scale"])):
+			kept_out += 1
+			continue
 		if color != "":
 			sub["color"] = color
 		var res = _place_object(sub)
@@ -4438,9 +4593,114 @@ func _scatter_objects(req : Dictionary) -> Dictionary:
 		points.append(Vector2(px, py))
 		placed.append(res["result"]["id"])
 
-	return _ok({ "placed": placed.size(), "ids": placed, "attempts": attempts,
-		"requested": count,
-		"note": ("min_gap too large for this area; placed fewer than requested" if placed.size() < count else "") })
+	var note = ""
+	if placed.size() < count:
+		note = "min_gap too large for this area; placed fewer than requested"
+		if kept_out > 0:
+			note = ("placed fewer than requested: %d attempt(s) reached a wall or an " +
+				"avoid_rect. Shrink wall_margin, the scale range or min_gap, or widen " +
+				"the rect") % kept_out
+	var out := { "placed": placed.size(), "ids": placed, "attempts": attempts,
+		"requested": count, "note": note }
+	if keep_out["active"]:
+		out["kept_out"] = kept_out
+	return _ok(out)
+
+func _scatter_keep_out(req : Dictionary, level, assets : Array, area : Rect2,
+		smax : float) -> Dictionary:
+	var out := { "active": false, "reach": {}, "grid": {}, "cell": 1.0, "rects": [],
+		"wall_margin": -1.0 }
+	var has_margin = req.has("wall_margin") and req["wall_margin"] != null
+	var raw_rects = req.get("avoid_rects", [])
+	if raw_rects == null:
+		raw_rects = []
+	if typeof(raw_rects) != TYPE_ARRAY:
+		return { "error": "'avoid_rects' must be a list of [x, y, w, h] rects" }
+	if not has_margin and raw_rects.empty():
+		return out
+	if raw_rects.size() > SCATTER_MAX_AVOID_RECTS:
+		return { "error": "'avoid_rects' is capped at %d rects" % SCATTER_MAX_AVOID_RECTS }
+	for i in range(raw_rects.size()):
+		var ar = raw_rects[i]
+		if typeof(ar) != TYPE_ARRAY or ar.size() != 4:
+			return { "error": "avoid_rects[%d] must be [x, y, w, h]" % i }
+		var rect = Rect2(float(ar[0]), float(ar[1]), float(ar[2]), float(ar[3]))
+		if rect.size.x <= 0.0 or rect.size.y <= 0.0:
+			return { "error": "avoid_rects[%d] needs a positive width and height" % i }
+		out["rects"].append(rect)
+	out["active"] = true
+	var widest = 0.0
+	for asset in assets:
+		var reach = _object_reach(str(asset))
+		out["reach"][asset] = reach
+		widest = max(widest, reach)
+	if has_margin:
+		var margin = float(req["wall_margin"])
+		if margin < 0.0:
+			return { "error": "'wall_margin' must be 0 or more" }
+		out["wall_margin"] = margin
+		var cell = max(SCATTER_MIN_CELL, widest * smax + margin)
+		out["cell"] = cell
+		var grid = out["grid"]
+		var near = area.grow(widest * smax + margin)
+		for wall in level.Walls.get_children():
+			var pts = wall.get("Points")
+			if pts == null or pts.size() < 2:
+				continue
+			var seg_count = pts.size() if wall.get("Loop") else pts.size() - 1
+			for i in range(seg_count):
+				var a = pts[i]
+				var b = pts[(i + 1) % pts.size()]
+				# Grown so an axis-aligned segment's zero-area box still intersects.
+				var bounds = Rect2(a, Vector2.ZERO).expand(b).grow(1.0)
+				if not near.intersects(bounds):
+					continue
+				var lo = (bounds.position / cell).floor()
+				var hi = (bounds.end / cell).floor()
+				for ix in range(int(lo.x), int(hi.x) + 1):
+					for iy in range(int(lo.y), int(hi.y) + 1):
+						var key = Vector2(ix, iy)
+						if not grid.has(key):
+							grid[key] = []
+						grid[key].append([a, b])
+	return out
+
+func _scatter_kept_out(keep_out : Dictionary, pos : Vector2, reach : float) -> bool:
+	if keep_out["wall_margin"] >= 0.0:
+		var limit = reach + float(keep_out["wall_margin"])
+		var home = (pos / float(keep_out["cell"])).floor()
+		var grid = keep_out["grid"]
+		for dx in [-1, 0, 1]:
+			for dy in [-1, 0, 1]:
+				var key = home + Vector2(dx, dy)
+				if not grid.has(key):
+					continue
+				for seg in grid[key]:
+					if pos.distance_to(_closest_point_on_segment(pos, seg[0], seg[1])) < limit:
+						return true
+	for rect in keep_out["rects"]:
+		var nearest = Vector2(clamp(pos.x, rect.position.x, rect.end.x),
+			clamp(pos.y, rect.position.y, rect.end.y))
+		if pos.distance_to(nearest) < reach:
+			return true
+	return false
+
+# Woxels from an Objects asset's centre to the farthest corner of its drawn
+# area at scale 1 (texture pixels are woxels for a prop at scale 1).
+func _object_reach(asset : String) -> float:
+	var tex = _asset_tex("Objects", asset)
+	if tex == null:
+		return 0.0
+	var size = tex.get_size()
+	var drawn = _opaque_rect(tex)
+	var lo = Vector2.ZERO
+	var hi = size
+	if drawn.size() == 4 and drawn[2] > 0 and drawn[3] > 0:
+		lo = Vector2(drawn[0], drawn[1])
+		hi = lo + Vector2(drawn[2], drawn[3])
+	var centre = size * 0.5
+	return max(max(centre.distance_to(lo), centre.distance_to(hi)),
+		max(centre.distance_to(Vector2(lo.x, hi.y)), centre.distance_to(Vector2(hi.x, lo.y))))
 
 func _room_rollback(wall_id, floor_error) -> Dictionary:
 	var removed = false
@@ -4577,7 +4837,7 @@ func _add_text(req : Dictionary) -> Dictionary:
 		text.fontColor = col
 		text.SetFont(font_name, size)
 		text.SetFontColor(col)
-	return _ok({ "id": _id(text), "size": text.fontSize, "color": "#" + text.fontColor.to_html(false) })
+	return _ok({ "id": _id(text), "size": text.fontSize, "color": "#" + _html(text.fontColor, false) })
 
 # ---------------------------------------------------------------------------
 # Terrain
@@ -5157,6 +5417,8 @@ func _modify_object(req : Dictionary) -> Dictionary:
 	if bad_modify_layer != null: return bad_modify_layer
 	var node = _resolve(req)
 	if node == null: return _err("no element with id " + str(req.get("id")))
+	if _is_light(node):
+		return _modify_light(req, node)
 
 	if req.has("color") and str(req.get("color", "")) != "":
 		return _err("colour is baked at placement and cannot be changed after: " +
@@ -5192,6 +5454,26 @@ func _modify_object(req : Dictionary) -> Dictionary:
 	if modulated:
 		out["modulate_applied"] = true
 	return _ok(out)
+
+func _modify_light(req : Dictionary, node) -> Dictionary:
+	var bad_light_color = _bad_color(req, ["color"])
+	if bad_light_color != null: return bad_light_color
+	for key in ["scale", "rotation", "shadow", "layer", "block_light", "modulate"]:
+		if req.has(key):
+			return _err(("'%s' does not apply to a light; a light takes color, energy, " +
+				"range and shadows. No changes were made.") % key)
+	if req.has("color") and str(req.get("color", "")) != "":
+		node.color = _color(req["color"], node.color)
+	if req.has("energy"):
+		node.energy = float(req["energy"])
+	if req.has("range"):
+		node.texture_scale = float(req["range"])
+	if req.has("shadows"):
+		node.shadow_enabled = bool(req["shadows"])
+	return _ok(_describe(node))
+
+func _is_light(node) -> bool:
+	return node.get("energy") != null and node.get("texture_scale") != null
 
 func _duplicate_object(req : Dictionary) -> Dictionary:
 	var level = Global.World.GetCurrentLevel()
@@ -5347,6 +5629,62 @@ func _signal_reaches(source, signal_name : String, target, method : String) -> b
 			return true
 	return false
 
+func _trim_snapshot() -> Dictionary:
+	var splats := []
+	for lvl in Global.World.levels:
+		if lvl == null or lvl.Terrain == null:
+			continue
+		splats.append({ "level": lvl, "splat": lvl.Terrain.CloneSplatImage(),
+			"splat2": _clone_splat2(lvl) })
+	var trace = Global.World.get("TraceImage")
+	var trace_at = null
+	if trace != null and is_instance_valid(trace) and trace.texture != null:
+		trace_at = trace.position
+	return { "splats": splats, "trace_at": trace_at }
+
+func _trim_cut(img, left : int, top : int, size : Vector2):
+	if not (img is Image):
+		return null
+	var out = Image.new()
+	out.create(int(size.x), int(size.y), false, img.get_format())
+	out.blit_rect(img, Rect2(-left * SPLAT_PX_PER_TILE, -top * SPLAT_PX_PER_TILE,
+		size.x, size.y), Vector2.ZERO)
+	return out
+
+func _trim_repair(snap : Dictionary, left : int, top : int) -> void:
+	for entry in snap["splats"]:
+		var lvl = entry["level"]
+		if not is_instance_valid(lvl) or lvl.Terrain == null:
+			continue
+		var now = lvl.Terrain.CloneSplatImage()
+		if now == null:
+			continue
+		var img = _trim_cut(entry["splat"], left, top, now.get_size())
+		var img2 = _trim_cut(entry["splat2"], left, top, now.get_size())
+		if img == null:
+			continue
+		if img2 != null and lvl.Terrain.has_method("RestoreSplat2"):
+			lvl.Terrain.RestoreSplat2(img, img2)
+		else:
+			lvl.Terrain.RestoreSplat(img)
+		lvl.Terrain.UpdateSplat()
+	for lvl in Global.World.levels:
+		var cave = lvl.get("CaveMesh") if lvl != null else null
+		if cave != null and cave.has_method("FinalizeMeshAndBorders"):
+			cave.FinalizeMeshAndBorders()
+	var trace = Global.World.get("TraceImage")
+	if snap["trace_at"] != null and trace != null and is_instance_valid(trace) \
+			and trace.position.distance_to(snap["trace_at"]) < 0.5:
+		trace.position = snap["trace_at"] + Vector2(left, top) * WOXELS_PER_TILE
+
+func _forget_history() -> bool:
+	for op in _undo_stack:
+		_release_op(op)
+	_undo_stack = []
+	_lost_serial = _op_serial
+	_discard_redo()
+	return true
+
 func _set_map_size(req : Dictionary) -> Dictionary:
 	if not req.has("width") or not req.has("height"):
 		return _err("'width' and 'height' are required, in tiles")
@@ -5368,8 +5706,15 @@ func _set_map_size(req : Dictionary) -> Dictionary:
 			"at the size you need from Dungeondraft's New Map dialog instead")
 	var old_w = int(Global.World.Width)
 	var old_h = int(Global.World.Height)
-	var right : int = w - old_w
-	var bottom : int = h - old_h
+
+	var left : int = int(req.get("left", 0))
+	var top : int = int(req.get("top", 0))
+	if left > 0 or top > 0:
+		return _err("left and top may only trim (0 or negative): adding tiles " +
+			"on the left or top is not supported")
+	var right : int = w - old_w - left
+	var bottom : int = h - old_h - top
+	var shift = [left * WOXELS_PER_TILE, top * WOXELS_PER_TILE]
 	var steps := 0
 
 	var limit := 64
@@ -5381,23 +5726,33 @@ func _set_map_size(req : Dictionary) -> Dictionary:
 	var rewired = ok_button != null and not _signal_reaches(ok_button, "pressed", win, "_on_OkayButton_pressed")
 	if rewired:
 		limit = 1000000
-	while (right != 0 or bottom != 0) and steps < 32:
+	while (right != 0 or bottom != 0 or left != 0 or top != 0) and steps < 32:
 		var dr = int(clamp(right, -limit, limit))
 		var db = int(clamp(bottom, -limit, limit))
+		var dl = int(clamp(left, -limit, limit))
+		var dt = int(clamp(top, -limit, limit))
+		# The patch repairs a Left/Top trim itself; vanilla needs the bridge to.
+		var repair = null
+		if not rewired and (dl != 0 or dt != 0):
+			repair = _trim_snapshot()
 		if rewired:
 			win.emit_signal("about_to_show")
 		else:
 			win.call("_on_ChangeMapSizeWindow_about_to_show")
-		_map_size_side(win, "Top", 0, not rewired)
-		_map_size_side(win, "Left", 0, not rewired)
+		_map_size_side(win, "Top", dt, not rewired)
+		_map_size_side(win, "Left", dl, not rewired)
 		_map_size_side(win, "Right", dr, not rewired)
 		_map_size_side(win, "Bottom", db, not rewired)
 		if rewired:
 			ok_button.emit_signal("pressed")
 		else:
 			win.call("_on_OkayButton_pressed")
+		if repair != null:
+			_trim_repair(repair, dl, dt)
 		right -= dr
 		bottom -= db
+		left -= dl
+		top -= dt
 		steps += 1
 	# Read back rather than trusting the dialog: the size, and every level's
 	# splat, which is what the saver writes and what broke before.
@@ -5420,15 +5775,22 @@ func _set_map_size(req : Dictionary) -> Dictionary:
 		return _err("the map is %dx%d but the terrain of level(s) %s was not " % [w, h, str(stale)] +
 			"resized with it; do not save this map. Reopen it and create the " +
 			"map at size from Dungeondraft's New Map dialog")
+	# Every element moved, so history would put things back where they were
+	# before the shift. Forget it rather than undo into the wrong place.
+	var history_cleared = shift != [0, 0] and _forget_history()
 	return _ok({ "width_tiles": w, "height_tiles": h,
 		"previous_tiles": [old_w, old_h],
 		"map_size_woxels": [Global.World.WoxelDimensions.x,
 			Global.World.WoxelDimensions.y],
 		"levels_resized": checked,
 		"steps": steps,
+		"content_shift_woxels": shift,
+		"history_cleared": history_cleared,
 		"note": "the top-left origin is kept: the map grows or shrinks on the " +
 			"right and bottom. Nothing placed is moved, and shrinking does not " +
-			"delete what now lies outside the map" })
+			"delete what now lies outside the map" if shift == [0, 0] else
+			"Dungeondraft moved the map's content by content_shift_woxels; " +
+			"shrinking does not delete what now lies outside the map" })
 
 # ---------------------------------------------------------------------------
 # Capture
@@ -5962,7 +6324,7 @@ func _describe(node, want_points : bool = true, want_opaque : bool = false) -> D
 			td["size"] = int(fsize)
 		var fcolor = node.get("fontColor")
 		if fcolor != null and fcolor is Color:
-			td["color"] = "#" + fcolor.to_html(false)
+			td["color"] = "#" + _html(fcolor, false)
 		var fname = node.get("fontName")
 		if fname != null and str(fname) != "":
 			td["font"] = str(fname)
@@ -5990,7 +6352,7 @@ func _describe(node, want_points : bool = true, want_opaque : bool = false) -> D
 					d["opaque_rect"] = opaque
 	var col = _read_node_color(node)
 	if col != null:
-		d["color"] = "#" + col.to_html(false)
+		d["color"] = "#" + _html(col, false)
 
 	var shadow = node.get("HasShadow")
 	if shadow != null:
@@ -6032,7 +6394,7 @@ func _describe(node, want_points : bool = true, want_opaque : bool = false) -> D
 		d["energy"] = float(energy)
 		var lc = node.get("color")
 		if lc != null and lc is Color:
-			d["color"] = "#" + lc.to_html(false)
+			d["color"] = "#" + _html(lc, false)
 		var reach = node.get("texture_scale")
 		if reach != null:
 			d["range"] = float(reach)
@@ -6042,7 +6404,7 @@ func _describe(node, want_points : bool = true, want_opaque : bool = false) -> D
 	var mod_tint = _read_node_modulate(node)
 	if mod_tint != null:
 
-		d["modulate"] = "#" + mod_tint.to_html(false)
+		d["modulate"] = "#" + _html(mod_tint, false)
 
 	var loop = node.get("Loop")
 	if loop != null:
@@ -6297,6 +6659,18 @@ func _color(v, fallback : Color) -> Color:
 			a = float(v[3])
 		return Color(float(v[0]), float(v[1]), float(v[2]), a)
 	return fallback
+
+func _html(c : Color, alpha : bool) -> String:
+	var out = ""
+	for v in ([c.a, c.r, c.g, c.b] if alpha else [c.r, c.g, c.b]):
+
+		var x = Color(float(v) * 255.0, 0, 0).r
+		var n = floor(x)
+		var frac = x - n
+		if frac > 0.5 or (frac == 0.5 and int(n) % 2 == 1):
+			n += 1
+		out += "%02x" % int(clamp(n, 0, 255))
+	return out
 
 func _set_node_color(node, color : Color) -> String:
 	if node.has_method("SetColor"):
@@ -7133,6 +7507,20 @@ func _bridge_sha256() -> String:
 	# Carriage returns are dropped on both sides, so a CRLF checkout agrees.
 	_bridge_sha = src.substr(DD_SCRIPT_HEADER.length()).replace("\r", "").sha256_text()
 	return _bridge_sha
+
+const BRIDGE_MANIFEST := "mcp_bridge.ddmod"
+var _bridge_version := ""
+
+func _read_bridge_version() -> String:
+	var path = str(Global.get("Root", "")) + BRIDGE_MANIFEST
+	var f = File.new()
+	if not f.file_exists(path) or f.open(path, File.READ) != OK:
+		return ""
+	var parsed = JSON.parse(f.get_as_text())
+	f.close()
+	if parsed.error != OK or typeof(parsed.result) != TYPE_DICTIONARY:
+		return ""
+	return str(parsed.result.get("version", ""))
 
 func _ok(result) -> Dictionary:
 	return { "ok": true, "result": result }
