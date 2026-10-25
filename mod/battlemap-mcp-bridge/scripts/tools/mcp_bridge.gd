@@ -4702,18 +4702,20 @@ func _object_reach(asset : String) -> float:
 	return max(max(centre.distance_to(lo), centre.distance_to(hi)),
 		max(centre.distance_to(Vector2(lo.x, hi.y)), centre.distance_to(Vector2(hi.x, lo.y))))
 
-func _room_rollback(wall_id, floor_error) -> Dictionary:
-	var removed = false
-	if wall_id != null:
-		var del = _delete_element({ "id": int(wall_id) })
-		removed = del.get("ok", false)
-	if removed:
-		return _err(("the room's floor could not be created (%s), so the room was not " +
-			"built and the wall drawn for it has been removed. Nothing remains on the map.")
+# Undo the walls a failed build_room drew. `wall_ids` is every wall it drew:
+# one loop, or one open run per uncovered stretch of a shared boundary.
+func _room_rollback(wall_ids : Array, floor_error) -> Dictionary:
+	var left := []
+	for wall_id in wall_ids:
+		if wall_id == null or not _delete_element({ "id": int(wall_id) }).get("ok", false):
+			left.append(str(wall_id))
+	if left.empty():
+		return _err(("the room could not be completed (%s), so it was not " +
+			"built and the walls drawn for it have been removed. Nothing remains on the map.")
 			% str(floor_error))
-	return _err(("the room's floor could not be created (%s), and the wall drawn for it " +
-		"(id %s) could NOT be removed. Delete that wall before retrying, or the retry " +
-		"will leave two walls on top of each other.") % [str(floor_error), str(wall_id)])
+	return _err(("the room could not be completed (%s), and the walls drawn for it " +
+		"(ids %s) could NOT be removed. Delete them before retrying, or the retry " +
+		"will leave two walls on top of each other.") % [str(floor_error), ", ".join(left)])
 
 func _build_room(req : Dictionary) -> Dictionary:
 	var level = Global.World.GetCurrentLevel()
@@ -4750,19 +4752,38 @@ func _build_room(req : Dictionary) -> Dictionary:
 				"asset, so NOTHING was created. Choose one from " +
 				"list_assets(category='Terrain').") % str(req.get("floor_asset", "")))
 
-	var result := {}
+	# wall_runs: the server found part of this boundary already walled (a
+	# neighbouring room), so draw only the uncovered runs, each an open wall.
+	var runs := []
+	if req.has("wall_runs"):
+		runs = req["wall_runs"]
+		if typeof(runs) != TYPE_ARRAY or runs.empty():
+			return _err("'wall_runs' must be a non-empty list of point lists")
+		for run in runs:
+			if typeof(run) != TYPE_ARRAY or run.size() < 2:
+				return _err("each of 'wall_runs' needs >= 2 [x,y] pairs")
 
-	# 1) Wall loop along the boundary.
-	var wall_req := {
-		"points": pts_raw, "loop": true,
-		"asset": req.get("wall_asset", ""),
-		"type": req.get("wall_type", 0), "joint": req.get("wall_joint", 1),
-		"shadow": req.get("wall_shadow", true),
-	}
-	var wall_res = _draw_wall(wall_req)
-	if not wall_res.get("ok", false):
-		return wall_res
-	result["wall_id"] = wall_res["result"].get("id")
+	var result := {}
+	var drawn := []
+
+	# 1) Walls along the boundary: one loop, or the given open runs.
+	var paths := [pts_raw] if runs.empty() else runs
+	for path in paths:
+		var wall_res = _draw_wall({
+			"points": path, "loop": runs.empty(),
+			"asset": req.get("wall_asset", ""),
+			"type": req.get("wall_type", 0), "joint": req.get("wall_joint", 1),
+			"shadow": req.get("wall_shadow", true),
+		})
+		if not wall_res.get("ok", false):
+			if drawn.empty():
+				return wall_res
+			return _room_rollback(drawn, wall_res.get("error"))
+		drawn.append(wall_res["result"].get("id"))
+	if runs.empty():
+		result["wall_id"] = drawn[0]
+	else:
+		result["wall_ids"] = drawn
 
 	# 2) Floor along the SAME boundary (no inset — the wall covers the seam).
 	var floor_kind = str(req.get("floor", "pattern"))
@@ -4778,7 +4799,7 @@ func _build_room(req : Dictionary) -> Dictionary:
 		if fres.get("ok", false):
 			result["floor_id"] = fres["result"].get("id")
 		else:
-			return _room_rollback(result.get("wall_id"), fres.get("error"))
+			return _room_rollback(drawn, fres.get("error"))
 	elif floor_kind == "terrain":
 		var tr := {
 			"points": pts_raw, "slot": int(req.get("floor_slot", 1)),
@@ -4789,7 +4810,7 @@ func _build_room(req : Dictionary) -> Dictionary:
 		if tres.get("ok", false):
 			result["floor_pixels"] = tres["result"].get("pixels")
 		else:
-			return _room_rollback(result.get("wall_id"), tres.get("error"))
+			return _room_rollback(drawn, tres.get("error"))
 	# floor_kind == "none" -> walls only
 
 	result["points"] = pts_raw
