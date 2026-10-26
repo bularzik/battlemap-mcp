@@ -113,6 +113,7 @@ The following is the public MCP tool surface; the companion may perform several 
 | `delete_elements` | `ids` |
 | `add_level` | `label` |
 | `set_map_size` | `width`, `height` |
+| `set_grid` | `visible` |
 | `delete_level` | `id` |
 | `set_level` | `id` |
 | `screenshot` | `max_px` |
