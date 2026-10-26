@@ -75,6 +75,7 @@ const DEFAULT_PATTERN_TINT := Color(0.62, 0.5, 0.34)
 const MASK_VISIBLE_RED := 0.25
 
 const MASK_DOMINANT := 0.25
+const COLORABLE_DEFAULT_COLOR := "#6b3834"
 var _pack_mask_rules := {}
 const PATTERN_GREYSCALE_SAMPLE_PX := 64
 var _pattern_greyscale_cache := {}
@@ -3938,6 +3939,16 @@ func _place_one_object(req : Dictionary) -> Dictionary:
 	if tex == null: return _err("could not load object asset: " + str(req.get("asset")))
 
 	var wants_color = req.has("color") and str(req.get("color", "")) != ""
+	if not wants_color and _mask_fraction(tex) >= MASK_DOMINANT:
+		# A dominant mask with no colour renders flat red, and colour is baked
+		# at placement. Use Dungeondraft's own default instead.
+		var defaulted_req = req.duplicate()
+		defaulted_req["color"] = COLORABLE_DEFAULT_COLOR
+		var res = _place_object_tinted(defaulted_req, level, tex)
+		if res.get("ok", false):
+			res["result"]["color"] = COLORABLE_DEFAULT_COLOR
+			res["result"]["color_defaulted"] = true
+		return res
 	if wants_color:
 		return _place_object_tinted(req, level, tex)
 
@@ -4040,6 +4051,8 @@ func _place_objects(req : Dictionary) -> Dictionary:
 				entry["colorable"] = true
 			else:
 				entry["partly_masked"] = true
+		if out.get("color_defaulted", false):
+			entry["color_defaulted"] = true
 		if out.has("layer"):
 			entry["layer"] = out["layer"]
 		if out.has("light_id"):
@@ -4048,7 +4061,10 @@ func _place_objects(req : Dictionary) -> Dictionary:
 
 	var colorable := []
 	var partial := []
+	var defaulted := 0
 	for entry in placed:
+		if entry.get("color_defaulted", false):
+			defaulted += 1
 		if entry.get("colorable", false):
 			colorable.append(entry["id"])
 		elif entry.get("partly_masked", false):
@@ -4076,7 +4092,8 @@ func _place_objects(req : Dictionary) -> Dictionary:
 				"placement: delete them and place again with color=\"#rrggbb\".") \
 				% [colorable.size(), str(shown), " ..." if colorable.size() > 20 else ""]
 		return _ok({ "placed": placed.size(), "id_ranges": _id_ranges(_ids_of(placed)),
-			"colorable_without_color": colorable.size(), "undoable": true,
+			"colorable_without_color": colorable.size(), "color_defaulted": defaulted,
+			"undoable": true,
 			"note": (out_note + " " + partial_note).strip_edges() })
 	return _ok({ "placed": placed.size(), "objects": placed,
 		"ids": _ids_of(placed), "undoable": true, "note": (out_note + " " + partial_note).strip_edges() })
