@@ -1593,9 +1593,17 @@ func _set_trace_image(req : Dictionary) -> Dictionary:
 	if bool(req.get("center", false)) and trace.has_method("Center"):
 		trace.Center()
 		applied["centered"] = true
+	if req.has("offset_x") or req.has("offset_y"):
+		var moved = Global.World.get("TraceImage")
+		if moved == null or not is_instance_valid(moved) or not (moved is Node2D):
+			_release_tool(trace, was_active)
+			return _err("no trace image to offset; load one with path first")
+		var delta = Vector2(float(req.get("offset_x", 0.0)), float(req.get("offset_y", 0.0)))
+		moved.position += delta
+		applied["offset"] = _vec(delta)
 	_release_tool(trace, was_active)
 	if applied.empty():
-		return _err("give at least one of path, scale, opacity, center or clear")
+		return _err("give at least one of path, scale, opacity, center, offset_x, offset_y or clear")
 	# Read back what is drawn, not what was asked: the Sprite, not the flag.
 	var sprite = Global.World.get("TraceImage")
 	var drawn := false
@@ -1604,6 +1612,7 @@ func _set_trace_image(req : Dictionary) -> Dictionary:
 		drawn = sprite.is_visible_in_tree() and sprite.texture != null
 		if sprite.texture != null:
 			size = [sprite.texture.get_width(), sprite.texture.get_height()]
+			applied["position"] = _vec(sprite.position)
 	applied["visible"] = drawn
 	applied["image_size"] = size
 	return _ok(applied)
