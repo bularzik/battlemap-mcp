@@ -2896,9 +2896,11 @@ def place_pattern(
     asset: a pattern asset path from list_assets(category=...).
     category: which asset bank — 'Patterns', 'Patterns Colorable', 'Materials',
       'Simple Tiles', or 'Smart Tiles'.
-    color: '#rrggbb' tint. Omit it and a greyscale texture gets a neutral
-      brown, while one with its own colours (marble, painted tile) is left
-      untinted; the reply's texture_greyscale says which.
+    color: '#rrggbb' tint. Omit it and a greyscale texture, or one drawn as a
+      red colour mask (tileset_diamond, _ornate, _wood_damaged), gets a
+      neutral brown, while one with its own colours (marble, painted tile) is
+      left untinted; the reply's texture_greyscale and texture_red_mask say
+      which.
     rotation: pattern rotation in degrees.
     z: persistent layer VALUE, a multiple of 100 from -500 to 900.
       Default -100 sits below objects. Arbitrary z offsets cannot survive saving.
@@ -2951,7 +2953,8 @@ def build_room(
       or 'none' for walls only.
     floor_asset: the floor texture. floor_category: pattern bank for floor=
       'pattern' (e.g. 'Simple Tiles', 'Smart Tiles', 'Materials').
-    floor_color: optional '#rrggbb' tint (pattern floors).
+    floor_color: optional '#rrggbb' tint (pattern floors). Omitted, a greyscale
+      or red colour mask texture gets a neutral brown, as in place_pattern.
     wall_type: 0=auto, 1=manual, 2=cave. wall_joint: 0=sharp, 1=bevel, 2=round.
     snap: 'none', 'grid' or 'auto'; see get_snap_settings. A rect
       gets all four corners on the grid (on hex, the far one may shift).

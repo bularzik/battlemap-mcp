@@ -77,6 +77,13 @@ const MASK_VISIBLE_RED := 0.25
 const MASK_DOMINANT := 0.25
 var _pack_mask_rules := {}
 const PATTERN_GREYSCALE_SAMPLE_PX := 64
+# A texture whose coloured pixels are nearly all strong mask red is a colour
+# mask (tileset_diamond, _ornate, _wood_damaged): the tile tools tint the red,
+# so untinted it renders white. Measured on the core textures: masks have
+# red_share 0.98-1.0 and mean_spread 0.57-0.63; the reddest real colour texture
+# (infestation_tile) has red_share 1.0 but mean_spread 0.17.
+const RED_MASK_MIN_SHARE := 0.9
+const RED_MASK_MIN_SPREAD := 0.4
 var _pattern_greyscale_cache := {}
 
 const WOXELS_PER_TILE := 256
@@ -2690,6 +2697,9 @@ func _colour_stats(img : Image) -> Dictionary:
 func _greyscale_from(stats : Dictionary) -> bool:
 	return int(stats["opaque"]) > 0 and int(stats["coloured"]) <= int(stats["opaque"]) / 50
 
+func _red_mask_from(stats : Dictionary) -> bool:
+	return int(stats["coloured"]) > 0 and float(stats["red_share"]) >= RED_MASK_MIN_SHARE 		and float(stats["mean_spread"]) >= RED_MASK_MIN_SPREAD
+
 func _texture_is_greyscale(tex) -> bool:
 	return _greyscale_from(_texture_colour_stats(tex))
 
@@ -4463,13 +4473,15 @@ func _place_pattern(req : Dictionary) -> Dictionary:
 	var color
 	var used_default = false
 	var greyscale = null
+	var red_mask = null
 	var texture_colour = null
 	if req.has("color") and str(req.get("color", "")) != "":
 		color = _color(req["color"], DEFAULT_PATTERN_TINT)
 	else:
 		texture_colour = _texture_colour_stats(tex)
 		greyscale = _greyscale_from(texture_colour)
-		color = DEFAULT_PATTERN_TINT if greyscale else Color(1, 1, 1)
+		red_mask = _red_mask_from(texture_colour)
+		color = DEFAULT_PATTERN_TINT if greyscale or red_mask else Color(1, 1, 1)
 		used_default = true
 	if color.a < 0.05:
 		color = Color(color.r, color.g, color.b, 1.0)
@@ -4506,6 +4518,7 @@ func _place_pattern(req : Dictionary) -> Dictionary:
 		# patterns; pass an explicit `color` for an exact look).
 		result["used_default_tint"] = true
 		result["texture_greyscale"] = greyscale
+		result["texture_red_mask"] = red_mask
 		result["texture_colour"] = { "coloured_share": stepify(texture_colour["coloured_share"], 0.0001),
 			"mean_spread": stepify(texture_colour["mean_spread"], 0.0001),
 			"red_share": stepify(texture_colour["red_share"], 0.0001) }
