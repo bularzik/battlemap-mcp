@@ -4734,6 +4734,18 @@ def add_level(label: str = "Level") -> dict:
 
 
 @tool()
+def set_grid(visible: bool) -> dict:
+    """Show or hide the grid in the editor view. Returns {grid_visible}.
+
+    This changes only what the editor (and so screenshot) shows. Exports keep
+    their own `grid` option and put the editor grid back afterwards.
+    """
+    if not isinstance(visible, bool):
+        raise ValidationError(f"visible must be true or false, got {visible!r}")
+    return bridge.request("set_grid", visible=visible)
+
+
+@tool()
 def set_map_size(
     width: Annotated[int, Field(ge=PATCH_MAP_TILES_MIN, le=PATCH_MAP_TILES_MAX)],
     height: Annotated[int, Field(ge=PATCH_MAP_TILES_MIN, le=PATCH_MAP_TILES_MAX)],

@@ -2218,6 +2218,7 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		"generator_options": return _generator_options(req)
 		"delete_level": return _delete_level(req)
 		"set_map_size": return _set_map_size(req)
+		"set_grid": return _set_grid(req)
 		"get_cave": return _get_cave(req)
 		"set_cave_entrance": return _set_cave_entrance(req)
 		"dig_cave": return _dig_cave(req)
@@ -5684,6 +5685,17 @@ func _forget_history() -> bool:
 	_lost_serial = _op_serial
 	_discard_redo()
 	return true
+
+func _set_grid(req : Dictionary) -> Dictionary:
+	if not req.has("visible") or typeof(req["visible"]) != TYPE_BOOL:
+		return _err("visible must be true or false")
+	if Global.World == null or Global.World.GetCurrentLevel() == null:
+		return _err("no map open")
+	var grid_mesh = Global.World.get("GridMesh")
+	if grid_mesh == null:
+		return _err("this map has no grid mesh to show or hide")
+	grid_mesh.visible = bool(req["visible"])
+	return _ok({ "grid_visible": grid_mesh.visible })
 
 func _set_map_size(req : Dictionary) -> Dictionary:
 	if not req.has("width") or not req.has("height"):
