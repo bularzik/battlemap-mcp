@@ -78,6 +78,13 @@ const MASK_DOMINANT := 0.25
 const COLORABLE_DEFAULT_COLOR := "#6b3834"
 var _pack_mask_rules := {}
 const PATTERN_GREYSCALE_SAMPLE_PX := 64
+# A texture whose coloured pixels are nearly all strong mask red is a colour
+# mask (tileset_diamond, _ornate, _wood_damaged): the tile tools tint the red,
+# so untinted it renders white. Measured on the core textures: masks have
+# red_share 0.98-1.0 and mean_spread 0.57-0.63; the reddest real colour texture
+# (infestation_tile) has red_share 1.0 but mean_spread 0.17.
+const RED_MASK_MIN_SHARE := 0.9
+const RED_MASK_MIN_SPREAD := 0.4
 var _pattern_greyscale_cache := {}
 
 const WOXELS_PER_TILE := 256
@@ -2668,25 +2675,51 @@ func _preview_size(category : String, tex) -> Vector2:
 # full-colour pack art. Only a mask wants tinting: multiplying a coloured wall
 # would misrepresent the very thing the preview exists to show.
 func _is_greyscale(img : Image) -> bool:
+	return _greyscale_from(_colour_stats(img))
+
+# How coloured an image is: of its opaque pixels (every other one sampled),
+# how many have a channel spread over 0.08, how strong that spread is on
+# average among them, and how many of those are mask red (red above green
+# and blue, which stay equal): the colour-mask convention the tile tools tint.
+func _colour_stats(img : Image) -> Dictionary:
 	img.lock()
 	var opaque := 0
 	var coloured := 0
+	var red := 0
+	var spread_sum := 0.0
 	for y in range(0, img.get_height(), 2):
 		for x in range(0, img.get_width(), 2):
 			var c = img.get_pixel(x, y)
 			if c.a < 0.5:
 				continue
 			opaque += 1
-			if max(abs(c.r - c.g), max(abs(c.g - c.b), abs(c.r - c.b))) > 0.08:
+			var spread = max(abs(c.r - c.g), max(abs(c.g - c.b), abs(c.r - c.b)))
+			if spread > 0.08:
 				coloured += 1
+				spread_sum += spread
+				if c.r - max(c.g, c.b) > 0.08 and abs(c.g - c.b) <= 0.08:
+					red += 1
 	img.unlock()
-	return opaque > 0 and coloured <= opaque / 50
+	return { "opaque": opaque, "coloured": coloured,
+		"coloured_share": float(coloured) / float(opaque) if opaque > 0 else 0.0,
+		"mean_spread": spread_sum / float(coloured) if coloured > 0 else 0.0,
+		"red_share": float(red) / float(coloured) if coloured > 0 else 0.0 }
+
+func _greyscale_from(stats : Dictionary) -> bool:
+	return int(stats["opaque"]) > 0 and int(stats["coloured"]) <= int(stats["opaque"]) / 50
+
+func _red_mask_from(stats : Dictionary) -> bool:
+	return int(stats["coloured"]) > 0 and float(stats["red_share"]) >= RED_MASK_MIN_SHARE 		and float(stats["mean_spread"]) >= RED_MASK_MIN_SPREAD
 
 func _texture_is_greyscale(tex) -> bool:
+	return _greyscale_from(_texture_colour_stats(tex))
+
+func _texture_colour_stats(tex) -> Dictionary:
 	var key = str(tex.resource_path)
 	if key != "" and _pattern_greyscale_cache.has(key):
 		return _pattern_greyscale_cache[key]
-	var answer := false
+	var stats := { "opaque": 0, "coloured": 0, "coloured_share": 0.0, "mean_spread": 0.0,
+		"red_share": 0.0 }
 	var img = tex.get_data()
 	if img != null:
 		img = img.duplicate()
@@ -2695,10 +2728,10 @@ func _texture_is_greyscale(tex) -> bool:
 		img.convert(Image.FORMAT_RGBA8)
 		if img.get_width() > 0 and img.get_height() > 0:
 			img.resize(PATTERN_GREYSCALE_SAMPLE_PX, PATTERN_GREYSCALE_SAMPLE_PX, Image.INTERPOLATE_BILINEAR)
-			answer = _is_greyscale(img)
+			stats = _colour_stats(img)
 	if key != "":
-		_pattern_greyscale_cache[key] = answer
-	return answer
+		_pattern_greyscale_cache[key] = stats
+	return stats
 
 # Multiply an image by a colour, keeping alpha — what the tile tools do at
 # placement, applied to a preview-sized copy. Runs after the resize, so it
@@ -4467,11 +4500,15 @@ func _place_pattern(req : Dictionary) -> Dictionary:
 	var color
 	var used_default = false
 	var greyscale = null
+	var red_mask = null
+	var texture_colour = null
 	if req.has("color") and str(req.get("color", "")) != "":
 		color = _color(req["color"], DEFAULT_PATTERN_TINT)
 	else:
-		greyscale = _texture_is_greyscale(tex)
-		color = DEFAULT_PATTERN_TINT if greyscale else Color(1, 1, 1)
+		texture_colour = _texture_colour_stats(tex)
+		greyscale = _greyscale_from(texture_colour)
+		red_mask = _red_mask_from(texture_colour)
+		color = DEFAULT_PATTERN_TINT if greyscale or red_mask else Color(1, 1, 1)
 		used_default = true
 	if color.a < 0.05:
 		color = Color(color.r, color.g, color.b, 1.0)
@@ -4508,6 +4545,10 @@ func _place_pattern(req : Dictionary) -> Dictionary:
 		# patterns; pass an explicit `color` for an exact look).
 		result["used_default_tint"] = true
 		result["texture_greyscale"] = greyscale
+		result["texture_red_mask"] = red_mask
+		result["texture_colour"] = { "coloured_share": stepify(texture_colour["coloured_share"], 0.0001),
+			"mean_spread": stepify(texture_colour["mean_spread"], 0.0001),
+			"red_share": stepify(texture_colour["red_share"], 0.0001) }
 	# Enumeration is grouped by layer; the new shape need not be last.
 	for shape in all:
 		if existing_shapes.has(shape.get_instance_id()):
