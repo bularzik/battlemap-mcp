@@ -68,6 +68,7 @@ SERVER_FILES = (
     "preflight.py",
     "scene.py",
     "server.py",
+    "shared_walls.py",
     "snapping.py",
     "state_paths.py",
     "timing.py",

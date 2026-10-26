@@ -70,7 +70,7 @@ The following is the public MCP tool surface; the companion may perform several 
 | `add_portal` | `asset`, `x`, `y`, `closed`, `radius`, `mount`, `snap_max`, `flip`, `fallback_free`, `rotation`, `snap` |
 | `add_roof` | `points`, `asset`, `width`, `type`, `sorting`, `sunlight`, `sun_angle`, `sun_contrast` |
 | `place_pattern` | `asset`, `rect`, `points`, `category`, `color`, `rotation`, `z` |
-| `build_room` | `rect`, `points`, `wall_asset`, `floor`, `floor_asset`, `floor_category`, `floor_color`, `floor_slot`, `wall_type`, `wall_joint`, `snap` |
+| `build_room` | `rect`, `points`, `wall_asset`, `floor`, `floor_asset`, `floor_category`, `floor_color`, `floor_slot`, `wall_type`, `wall_joint`, `snap`, `wall_runs` |
 | `scatter_objects` | `assets`, `rect`, `count`, `scale_min`, `scale_max`, `rotation_min`, `rotation_max`, `min_gap`, `color`, `sorting`, `layer`, `seed` |
 | `add_text` | `text`, `x`, `y`, `size`, `color`, `font` |
 | `generator_options` | `name`, `value` |

@@ -136,7 +136,8 @@ def test_build_room_snaps_both_rect_corners(bridge):
     _square_64(state)
     server.build_room(rect=[10, 10, 500, 300], floor="none", snap="auto")
     # (10, 10) -> (0, 0); (510, 310) -> (512, 320).
-    assert placed(sent)["rect"] == [0.0, 0.0, 512.0, 320.0]
+    [params] = [p for command, p in sent if command == "build_room"]
+    assert params["rect"] == [0.0, 0.0, 512.0, 320.0]
 
 
 def test_build_room_refuses_a_rect_the_grid_collapses(bridge):

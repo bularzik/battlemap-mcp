@@ -78,6 +78,7 @@ from .scene import (
     find_unexplained_lights,
     pack_census,
 )
+from .shared_walls import segments_of, split_boundary
 from .validation import (
     reject_smart_tiles,
     require_bare_filename,
@@ -2936,6 +2937,7 @@ def build_room(
     wall_type: int = 0,
     wall_joint: int = 1,
     snap: str = "",
+    shared_walls: str = "split",
 ) -> dict:
     """Build a room in one call: a looped wall AND a matching floor on the SAME path.
 
@@ -2955,13 +2957,19 @@ def build_room(
     wall_type: 0=auto, 1=manual, 2=cave. wall_joint: 0=sharp, 1=bevel, 2=round.
     snap: 'none', 'grid' or 'auto'; see get_snap_settings. A rect
       gets all four corners on the grid (on hex, the far one may shift).
+    shared_walls: 'split' (default) leaves out the parts of the boundary an
+      existing wall on this level already covers, so two rooms side by side
+      share ONE wall and a door placed on it opens in a VTT export. 'keep'
+      always draws the full loop.
 
-    Returns { wall_id, floor_id?, points }.
+    Returns { wall_id, floor_id?, points }, or, when walls were shared,
+    { wall_ids, shared_edges, floor_id?, points }.
     """
     if points is not None:
         require_points(points, minimum=3)
     if rect is not None:
         require_rect(rect)
+    require_choice(shared_walls, ["split", "keep"], "shared_walls")
     require_choice(floor, ["pattern", "terrain", "none"], "floor")
     if floor == "pattern" and not floor_asset:
         raise ValidationError(
@@ -3004,7 +3012,21 @@ def build_room(
         params["floor_asset"] = floor_asset
     if floor_color:
         params["floor_color"] = floor_color
-    return _with_snap(bridge.request("build_room", **params), snap_info)
+    shared: list = []
+    if shared_walls == "split":
+        if rect is not None:
+            x, y, w, h = (float(v) for v in rect)
+            boundary = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+        else:
+            boundary = params["points"]
+        walls, _ = _read_all("walls", include_points=True)
+        runs, shared = split_boundary(boundary, segments_of(walls))
+        if shared:
+            params["wall_runs"] = runs
+    result = bridge.request("build_room", **params)
+    if shared:
+        result = {**result, "shared_edges": shared}
+    return _with_snap(result, snap_info)
 
 
 @tool()
