@@ -2100,11 +2100,12 @@ def place_object(
 ) -> dict:
     """Place an object (prop) on the current map. Returns the new element id.
 
-    If you place a colourable asset WITHOUT a colour, the response comes back
-    with `colorable: true` and `mask_fraction`, and its note says whether the
-    object is a flat red shape or just has red accents.
-    Colour is baked at placement, so the fix is to delete it and place it
-    again with `color`.
+    A colourable asset placed WITHOUT a colour gets Dungeondraft's own default,
+    #6b3834, instead of rendering flat red, and the response says
+    `color_defaulted: true`. An asset with only a small colour mask is placed
+    untinted and comes back with `colorable: true`, `mask_fraction` and a note
+    that its accents show red. Colour is baked at placement, so to change it,
+    delete the object and place it again with `color`.
 
     asset: an Objects asset path from list_assets(category='Objects').
     x, y: woxel coordinates; defaults to map center. rotation: degrees.
@@ -2214,8 +2215,9 @@ def place_objects(
 
     Returns `objects`: one {id, position, layer} per entry, in the order you
     passed them (with `light_id` for an entry that has a `light`), plus `ids`.
-    Entries placed from a colourable asset with no color are listed in the
-    note: those are flat red, and colour cannot be added afterwards.
+    Entries placed from a colourable asset with no color get Dungeondraft's
+    default #6b3834 and carry `color_defaulted: true` (the compact reply counts
+    them in `color_defaulted`). Colour cannot be changed afterwards.
 
     One undo() reverses the whole batch while it is the latest operation.
     snap applies to every entry with an x and y; see get_snap_settings.
@@ -2577,7 +2579,7 @@ def arrange_objects(
     result["objects"] = items
     result["ids"] = placed.get("ids", [item.get("id") for item in items])
     result["placed"] = len(items)
-    for key in ("note", "colorable_without_color", "save_warning"):
+    for key in ("note", "colorable_without_color", "color_defaulted", "save_warning"):
         if key in placed:
             result[key] = placed[key]
     return result
