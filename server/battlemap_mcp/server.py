@@ -17,6 +17,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -3375,6 +3376,8 @@ def set_trace_image(
     opacity: float | None = None,
     center: bool = False,
     clear: bool = False,
+    offset_x: float | None = None,
+    offset_y: float | None = None,
 ) -> dict:
     """Put a reference image under the map to trace over. Returns what applied.
 
@@ -3390,6 +3393,10 @@ def set_trace_image(
       without drowning what you are drawing.
     center: centre the image on the map.
     clear: remove the trace image.
+    offset_x, offset_y: move the image by this many woxels (256 per grid
+      square), applied after center and scale. Centre it, then offset it until
+      a grid line drawn on the image lies on a map grid line. The reply's
+      `position` is where the image sits afterwards.
 
     Loading an image shows it and clear hides it. `visible` says whether it is
     drawn now and `image_size` is null if the image did not load. Exports never
@@ -3408,6 +3415,9 @@ def set_trace_image(
         raise ValidationError(f"opacity must be between 0 and 1, got {opacity}")
     if scale is not None:
         require_positive(scale, "scale")
+    for name, offset in (("offset_x", offset_x), ("offset_y", offset_y)):
+        if offset is not None and not math.isfinite(offset):
+            raise ValidationError(f"{name} must be a finite number of woxels, got {offset}")
     params: dict = {}
     copied_from = None
     if path:
@@ -3420,8 +3430,14 @@ def set_trace_image(
         params["center"] = True
     if clear:
         params["clear"] = True
+    if offset_x is not None:
+        params["offset_x"] = offset_x
+    if offset_y is not None:
+        params["offset_y"] = offset_y
     if not params:
-        raise ValidationError("give at least one of path, scale, opacity, center or clear")
+        raise ValidationError(
+            "give at least one of path, scale, opacity, center, offset_x, offset_y or clear"
+        )
     result = bridge.request("set_trace_image", **params)
     if copied_from is not None:
         result["copied_from"] = copied_from
