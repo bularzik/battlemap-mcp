@@ -33,6 +33,10 @@ def sent(monkeypatch):
     return calls
 
 
+def test_list_assets_documents_the_default():
+    assert DEFAULT in server.list_assets.__doc__
+
+
 @pytest.mark.parametrize("tool", [server.place_object, server.place_objects])
 def test_docs_promise_the_default(tool):
     doc = tool.__doc__

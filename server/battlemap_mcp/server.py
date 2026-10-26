@@ -1128,8 +1128,9 @@ def list_assets(
     search_pack_contents before concluding an asset does not exist.
 
     `colorable` lists INDEXES into `assets` of assets with a colour mask: they
-    take `color` at placement, and the mask shows red without one. Colour
-    cannot be changed afterwards — check before choosing.
+    take `color` at placement. Without one, a mostly-mask asset gets the
+    default #6b3834; a small mask shows red. Colour cannot be changed
+    afterwards — check before choosing.
 
     `sizes` [w, h] is each asset's canvas and `drawn` [x, y, w, h] the part its
     art covers, in woxels at scale 1, parallel to `assets`. Pack art often fills
