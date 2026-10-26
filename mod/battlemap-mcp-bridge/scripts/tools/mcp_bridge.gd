@@ -2660,12 +2660,14 @@ func _is_greyscale(img : Image) -> bool:
 	return _greyscale_from(_colour_stats(img))
 
 # How coloured an image is: of its opaque pixels (every other one sampled),
-# how many have a channel spread over 0.08, and how strong that spread is on
-# average among them.
+# how many have a channel spread over 0.08, how strong that spread is on
+# average among them, and how many of those are mask red (red above green
+# and blue, which stay equal): the colour-mask convention the tile tools tint.
 func _colour_stats(img : Image) -> Dictionary:
 	img.lock()
 	var opaque := 0
 	var coloured := 0
+	var red := 0
 	var spread_sum := 0.0
 	for y in range(0, img.get_height(), 2):
 		for x in range(0, img.get_width(), 2):
@@ -2677,10 +2679,13 @@ func _colour_stats(img : Image) -> Dictionary:
 			if spread > 0.08:
 				coloured += 1
 				spread_sum += spread
+				if c.r - max(c.g, c.b) > 0.08 and abs(c.g - c.b) <= 0.08:
+					red += 1
 	img.unlock()
 	return { "opaque": opaque, "coloured": coloured,
 		"coloured_share": float(coloured) / float(opaque) if opaque > 0 else 0.0,
-		"mean_spread": spread_sum / float(coloured) if coloured > 0 else 0.0 }
+		"mean_spread": spread_sum / float(coloured) if coloured > 0 else 0.0,
+		"red_share": float(red) / float(coloured) if coloured > 0 else 0.0 }
 
 func _greyscale_from(stats : Dictionary) -> bool:
 	return int(stats["opaque"]) > 0 and int(stats["coloured"]) <= int(stats["opaque"]) / 50
@@ -2692,7 +2697,8 @@ func _texture_colour_stats(tex) -> Dictionary:
 	var key = str(tex.resource_path)
 	if key != "" and _pattern_greyscale_cache.has(key):
 		return _pattern_greyscale_cache[key]
-	var stats := { "opaque": 0, "coloured": 0, "coloured_share": 0.0, "mean_spread": 0.0 }
+	var stats := { "opaque": 0, "coloured": 0, "coloured_share": 0.0, "mean_spread": 0.0,
+		"red_share": 0.0 }
 	var img = tex.get_data()
 	if img != null:
 		img = img.duplicate()
@@ -4501,7 +4507,8 @@ func _place_pattern(req : Dictionary) -> Dictionary:
 		result["used_default_tint"] = true
 		result["texture_greyscale"] = greyscale
 		result["texture_colour"] = { "coloured_share": stepify(texture_colour["coloured_share"], 0.0001),
-			"mean_spread": stepify(texture_colour["mean_spread"], 0.0001) }
+			"mean_spread": stepify(texture_colour["mean_spread"], 0.0001),
+			"red_share": stepify(texture_colour["red_share"], 0.0001) }
 	# Enumeration is grouped by layer; the new shape need not be last.
 	for shape in all:
 		if existing_shapes.has(shape.get_instance_id()):
