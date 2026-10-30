@@ -17,6 +17,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -78,6 +79,7 @@ from .scene import (
     find_unexplained_lights,
     pack_census,
 )
+from .shared_walls import segments_of, split_boundary
 from .validation import (
     reject_smart_tiles,
     require_bare_filename,
@@ -2098,12 +2100,6 @@ def place_object(
 ) -> dict:
     """Place an object (prop) on the current map. Returns the new element id.
 
-    If you place a colourable asset WITHOUT a colour, the response comes back
-    with `colorable: true` and `mask_fraction`, and its note says whether the
-    object is a flat red shape or just has red accents.
-    Colour is baked at placement, so the fix is to delete it and place it
-    again with `color`.
-
     asset: an Objects asset path from list_assets(category='Objects').
     x, y: woxel coordinates; defaults to map center. rotation: degrees.
     sorting: 0=over, 1=under. snap: 'none', 'grid' or 'auto'; see get_snap_settings.
@@ -2205,15 +2201,10 @@ def place_objects(
     never holds a half-finished batch whose ids you were not told.
 
     file: an absolute path to a JSON file of the same entries (a list, or
-      {"objects": [...]}), up to 1000. Use it when a script computed the
+      {\"objects\": [...]}), up to 1000. Use it when a script computed the
       positions: write the file and pass its path instead of copying hundreds
       of entries into the call. The reply is compact: `placed`, `id_ranges`
       ([first, last] runs of ids) and `colorable_without_color`.
-
-    Returns `objects`: one {id, position, layer} per entry, in the order you
-    passed them (with `light_id` for an entry that has a `light`), plus `ids`.
-    Entries placed from a colourable asset with no color are listed in the
-    note: those are flat red, and colour cannot be added afterwards.
 
     One undo() reverses the whole batch while it is the latest operation.
     snap applies to every entry with an x and y; see get_snap_settings.
@@ -2896,9 +2887,11 @@ def place_pattern(
     asset: a pattern asset path from list_assets(category=...).
     category: which asset bank — 'Patterns', 'Patterns Colorable', 'Materials',
       'Simple Tiles', or 'Smart Tiles'.
-    color: '#rrggbb' tint. Omit it and a greyscale texture gets a neutral
-      brown, while one with its own colours (marble, painted tile) is left
-      untinted; the reply's texture_greyscale says which.
+    color: '#rrggbb' tint. Omit it and a greyscale texture, or one drawn as a
+      red colour mask (tileset_diamond, _ornate, _wood_damaged), gets a
+      neutral brown, while one with its own colours (marble, painted tile) is
+      left untinted; the reply's texture_greyscale and texture_red_mask say
+      which.
     rotation: pattern rotation in degrees.
     z: persistent layer VALUE, a multiple of 100 from -500 to 900.
       Default -100 sits below objects. Arbitrary z offsets cannot survive saving.
@@ -2936,6 +2929,7 @@ def build_room(
     wall_type: int = 0,
     wall_joint: int = 1,
     snap: str = "",
+    shared_walls: str = "split",
 ) -> dict:
     """Build a room in one call: a looped wall AND a matching floor on the SAME path.
 
@@ -2951,17 +2945,30 @@ def build_room(
       or 'none' for walls only.
     floor_asset: the floor texture. floor_category: pattern bank for floor=
       'pattern' (e.g. 'Simple Tiles', 'Smart Tiles', 'Materials').
-    floor_color: optional '#rrggbb' tint (pattern floors).
+    floor_color: optional '#rrggbb' tint (pattern floors). Omitted, a greyscale
+      or red colour mask texture gets a neutral brown, as in place_pattern.
     wall_type: 0=auto, 1=manual, 2=cave. wall_joint: 0=sharp, 1=bevel, 2=round.
     snap: 'none', 'grid' or 'auto'; see get_snap_settings. A rect
       gets all four corners on the grid (on hex, the far one may shift).
+    shared_walls: 'split' (default) leaves out the parts of the boundary an
+      existing wall on this level already covers, so two rooms side by side
+      share ONE wall and a door placed on it opens in a VTT export. Only a
+      wall of the same wall_type (and of wall_asset, when given) is shared.
+      A boundary walled all round gets no wall, only its floor; with
+      floor='none' that is refused. The shared wall belongs to the room
+      built first: deleting that room's wall later leaves this room open on
+      the shared side. 'keep' always draws the full loop.
 
-    Returns { wall_id, floor_id?, points }.
+    Returns { wall_id, floor_id?, points }, or, when walls were shared,
+    { wall_ids, shared_edges, floor_id?, points } (wall_ids may be empty).
+    On a map with more walls than one read covers, walls_considered and
+    shared_walls_note say how many were checked for sharing.
     """
     if points is not None:
         require_points(points, minimum=3)
     if rect is not None:
         require_rect(rect)
+    require_choice(shared_walls, ["split", "keep"], "shared_walls")
     require_choice(floor, ["pattern", "terrain", "none"], "floor")
     if floor == "pattern" and not floor_asset:
         raise ValidationError(
@@ -3004,7 +3011,48 @@ def build_room(
         params["floor_asset"] = floor_asset
     if floor_color:
         params["floor_color"] = floor_color
-    return _with_snap(bridge.request("build_room", **params), snap_info)
+    shared: list = []
+    coverage: dict = {"complete": True}
+    if shared_walls == "split":
+        if rect is not None:
+            x, y, w, h = (float(v) for v in rect)
+            boundary = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+        else:
+            boundary = params["points"]
+        walls, coverage = _read_all("walls", include_points=True)
+        # Borrow only a wall that looks like this room's own: same type, and
+        # the same asset when one was named (the default is resolved in
+        # Dungeondraft, so an unnamed asset matches any).
+        alike = [
+            w
+            for w in walls
+            if w.get("wall_type", wall_type) == wall_type
+            and not (wall_asset and w.get("asset") and w["asset"] != wall_asset)
+        ]
+        runs, shared = split_boundary(boundary, segments_of(alike))
+        if shared and not runs and floor == "none":
+            raise ValidationError(
+                "existing walls already cover this room's whole boundary, so with "
+                "floor='none' there is nothing to build. Pass shared_walls='keep' "
+                "to draw a second wall loop anyway."
+            )
+        if shared:
+            params["wall_runs"] = runs
+    result = bridge.request("build_room", **params)
+    if shared:
+        result = {**result, "shared_edges": shared}
+    if not coverage["complete"]:
+        unread = coverage["total"] - coverage["read"]
+        result = {
+            **result,
+            "walls_considered": {k: coverage[k] for k in ("total", "read", "complete")},
+            "shared_walls_note": (
+                f"only the first {coverage['read']} of {coverage['total']} walls were "
+                f"checked for sharing; {unread} were not, so this room may double a "
+                "wall among them"
+            ),
+        }
+    return _with_snap(result, snap_info)
 
 
 @tool()
@@ -3353,6 +3401,7 @@ def set_trace_image(
     opacity: float | None = None,
     center: bool = False,
     clear: bool = False,
+    position: list[float] | None = None,
 ) -> dict:
     """Put a reference image under the map to trace over. Returns what applied.
 
@@ -3368,6 +3417,12 @@ def set_trace_image(
       without drowning what you are drawing.
     center: centre the image on the map.
     clear: remove the trace image.
+    position: [x, y] in woxels (256 per grid square): where the image's
+      centre sits, applied after center and scale. Centre it, read the reply's
+      `position`, then set a position that puts a grid line drawn on the image
+      on a map grid line. It sets rather than nudges, so repeating the call is
+      harmless. A later center moves the image back to the map's centre and
+      discards it.
 
     Loading an image shows it and clear hides it. `visible` says whether it is
     drawn now and `image_size` is null if the image did not load. Exports never
@@ -3386,6 +3441,10 @@ def set_trace_image(
         raise ValidationError(f"opacity must be between 0 and 1, got {opacity}")
     if scale is not None:
         require_positive(scale, "scale")
+    if position is not None and (
+        len(position) != 2 or not all(math.isfinite(float(v)) for v in position)
+    ):
+        raise ValidationError(f"position must be [x, y], two finite woxel values, got {position}")
     params: dict = {}
     copied_from = None
     if path:
@@ -3398,8 +3457,12 @@ def set_trace_image(
         params["center"] = True
     if clear:
         params["clear"] = True
+    if position is not None:
+        params["position"] = [float(v) for v in position]
     if not params:
-        raise ValidationError("give at least one of path, scale, opacity, center or clear")
+        raise ValidationError(
+            "give at least one of path, scale, opacity, center, position or clear"
+        )
     result = bridge.request("set_trace_image", **params)
     if copied_from is not None:
         result["copied_from"] = copied_from
@@ -4731,6 +4794,23 @@ def delete_elements(ids: list[int]) -> dict:
 def add_level(label: str = "Level") -> dict:
     """Add a new level (floor) to the map. Returns its id and label."""
     return bridge.request("add_level", label=label)
+
+
+@tool()
+def set_grid(visible: bool) -> dict:
+    """Show or hide the grid in the editor view. Returns {grid_visible, grid_toggle}.
+
+    It works the View menu's own grid checkbox, so the menu and the screen
+    agree; grid_toggle is that checkbox's state. This changes only what the
+    editor (and so screenshot) shows. Exports keep their own `grid` option and
+    put the editor grid back afterwards.
+
+    It is not saved: neither the map file nor Dungeondraft's settings keep it,
+    so opening a map or restarting Dungeondraft shows the grid again.
+    """
+    if not isinstance(visible, bool):
+        raise ValidationError(f"visible must be true or false, got {visible!r}")
+    return bridge.request("set_grid", visible=visible)
 
 
 @tool()

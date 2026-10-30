@@ -70,7 +70,7 @@ The following is the public MCP tool surface; the companion may perform several 
 | `add_portal` | `asset`, `x`, `y`, `closed`, `radius`, `mount`, `snap_max`, `flip`, `fallback_free`, `rotation`, `snap` |
 | `add_roof` | `points`, `asset`, `width`, `type`, `sorting`, `sunlight`, `sun_angle`, `sun_contrast` |
 | `place_pattern` | `asset`, `rect`, `points`, `category`, `color`, `rotation`, `z` |
-| `build_room` | `rect`, `points`, `wall_asset`, `floor`, `floor_asset`, `floor_category`, `floor_color`, `floor_slot`, `wall_type`, `wall_joint`, `snap` |
+| `build_room` | `rect`, `points`, `wall_asset`, `floor`, `floor_asset`, `floor_category`, `floor_color`, `floor_slot`, `wall_type`, `wall_joint`, `snap`, `wall_runs` |
 | `scatter_objects` | `assets`, `rect`, `count`, `scale_min`, `scale_max`, `rotation_min`, `rotation_max`, `min_gap`, `color`, `sorting`, `layer`, `seed` |
 | `add_text` | `text`, `x`, `y`, `size`, `color`, `font` |
 | `generator_options` | `name`, `value` |
@@ -79,7 +79,7 @@ The following is the public MCP tool surface; the companion may perform several 
 | `set_verbose` | `on` |
 | `log_marker` | `text` |
 | `paint_material` | `points`, `asset`, `size`, `layer`, `smooth`, `erase` |
-| `set_trace_image` | `path`, `scale`, `opacity`, `center`, `clear` |
+| `set_trace_image` | `path`, `scale`, `opacity`, `center`, `position`, `clear` |
 | `get_map_style` | — |
 | `set_map_style` | `building_wear`, `grid_style` |
 | `set_water_style` | `deep_color`, `shallow_color`, `blend_distance`, `border` |
@@ -113,6 +113,7 @@ The following is the public MCP tool surface; the companion may perform several 
 | `delete_elements` | `ids` |
 | `add_level` | `label` |
 | `set_map_size` | `width`, `height` |
+| `set_grid` | `visible` |
 | `delete_level` | `id` |
 | `set_level` | `id` |
 | `screenshot` | `max_px` |

@@ -23,7 +23,11 @@ from uat_harness import (  # noqa: E402
     vanilla_colourable_assets,
 )
 
-from battlemap_mcp.errors import BridgeCommandError, BridgeUnavailableError  # noqa: E402
+from battlemap_mcp.errors import (  # noqa: E402
+    BridgeCommandError,
+    BridgeUnavailableError,
+    ValidationError,
+)
 
 GROUPS: dict[str, list] = {}
 
@@ -1274,6 +1278,53 @@ def colour(u: Uat) -> None:
 
     u.check("a refused recolour changes nothing", still_original)
 
+    # Placed without a colour, a colourable asset stays on the direct path and
+    # untinted: the note names Dungeondraft's default for the model to choose,
+    # and that colour, once chosen, is kept by the map file.
+    def default_named_not_applied():
+        r = u.c.request("place_object", asset=asset, x=u.cx, y=u.cy - 512)
+        try:
+            if float(r.get("mask_fraction", 0.0)) < 0.25:
+                return f"skipped: {short} is only partly masked ({r.get('mask_fraction')})"
+            assert "color" not in r and not r.get("color_defaulted"), f"colour applied: {r}"
+            assert r.get("placed_via") != "ObjectTool", f"took the tinted path: {r}"
+            assert "#6b3834" in r.get("note", ""), f"note does not name the default: {r}"
+        finally:
+            u.c.request("delete_element", id=r["id"])
+        map_file = u.c.request("get_status").get("map_file")
+        if not map_file:
+            return "skipped: the map has never been saved, so it cannot be reopened"
+        chosen = u.c.request("place_object", asset=asset, x=u.cx, y=u.cy - 768, color="#6b3834")
+        u.c.request("save_map")
+        time.sleep(1.0)
+        assert u.wait_for_save(), "save did not finish"
+        u.c.request("open_map", path=map_file)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            time.sleep(0.5)
+            try:
+                if u.c.request("get_status").get("undo_depth") == 0:
+                    break
+            except Exception:
+                continue
+        # Ids are not kept across a reopen: find the object where it was put.
+        listed = u.c.request("list_elements", kind="objects", limit=500)["elements"]
+        # A disposable map may hold copies from earlier runs at the same spot.
+        here = [
+            e for e in listed if e.get("asset") == asset and e.get("position") == [u.cx, u.cy - 768]
+        ]
+        for e in here:
+            u.c.request("delete_element", id=e["id"])
+        assert here, f"nothing at the placed spot after reopen (placed id {chosen['id']})"
+        assert all(e.get("color") == "#6b3834" for e in here), [e.get("color") for e in here]
+        return f"{short}: untinted with the hint; #6b3834 chosen survives save and reopen"
+
+    u.check(
+        "colourable: the default is named, not applied, and survives when chosen",
+        default_named_not_applied,
+        needs_dirty=True,
+    )
+
 
 @group("hooks")
 def hooks(u: Uat) -> None:
@@ -2489,6 +2540,28 @@ def settings(u: Uat) -> None:
         updates._result = notice_saved
 
 
+@group("editor_grid")
+def editor_grid(u: Uat) -> None:
+    """set_grid works the View menu's checkbox, so the menu matches the screen."""
+
+    # regression: set_grid flipped GridMesh.visible behind the editor's back, so
+    # the View menu's checkbox showed the opposite of the screen and the user's
+    # next click on it did the opposite of what they expected.
+    def checkbox_follows_the_grid():
+        seen = []
+        try:
+            for want in (False, True, False):
+                r = u.c.request("set_grid", visible=want)
+                assert r["grid_visible"] is want, f"grid {r['grid_visible']} for {want}"
+                assert r["grid_toggle"] is want, f"checkbox {r['grid_toggle']} for {want}"
+                seen.append(want)
+        finally:
+            u.c.request("set_grid", visible=True)
+        return f"grid and View-menu checkbox agree through {seen}"
+
+    u.check("editor_grid: the View menu checkbox follows set_grid", checkbox_follows_the_grid)
+
+
 @group("checkpoint")
 def checkpoint(u: Uat) -> None:
     """Runtime behavior and validation."""
@@ -2891,6 +2964,201 @@ def dd2vtt(u: Uat) -> None:
     )
 
 
+@group("shared_walls")
+def shared_walls(u: Uat) -> None:
+    """Two rooms side by side share one wall, so a door between them opens in a VTT."""
+    import importlib
+    import itertools
+    import json
+    import math
+    import tempfile
+
+    server = importlib.import_module("battlemap_mcp.server")
+    door = u.asset("Portals", "door")
+    floor = u.asset("Simple Tiles", "")
+    T = 256
+    x0, y0 = u.cx + 4 * T, u.cy - 6 * T
+
+    def walls_in_the_way():
+        walls = u.c.request("list_elements", kind="walls", include_points=True, limit=1000)
+        return [
+            w["id"]
+            for w in walls["elements"]
+            if any(
+                x0 - T <= p[0] <= x0 + 7 * T and y0 - T <= p[1] <= y0 + 4 * T
+                for p in w.get("points") or []
+            )
+        ]
+
+    def walls_across_the_door(mode: str) -> tuple[int, dict]:
+        """Build A and B (mode), put a door on the shared edge, export; count
+        line-of-sight segments lying along the doorway."""
+        server.checkpoint("shared_walls")
+        try:
+            server.build_room(rect=[x0, y0, 3 * T, 3 * T], floor="none", snap="none")
+            b = server.build_room(
+                rect=[x0 + 3 * T, y0, 3 * T, 3 * T],
+                floor="none",
+                snap="none",
+                shared_walls=mode,
+            )
+            server.add_portal(door, x=x0 + 3 * T, y=y0 + 1.5 * T, mount="wall")
+            with tempfile.TemporaryDirectory() as out:
+                written = server.export_dd2vtt(path=str(pathlib.Path(out) / "rooms.dd2vtt"), ppi=16)
+                export = json.loads(pathlib.Path(written["path"]).read_text())
+        finally:
+            server.rollback_checkpoint("shared_walls")
+        (portal,) = export["portals"]
+        (a, b_end) = ((p["x"], p["y"]) for p in portal["bounds"])
+        length = math.dist(a, b_end)
+        ux, uy = (b_end[0] - a[0]) / length, (b_end[1] - a[1]) / length
+        crossing = 0
+        for run in export["line_of_sight"]:
+            for p, q in itertools.pairwise((pt["x"], pt["y"]) for pt in run):
+                off_line = [abs((pt[0] - a[0]) * uy - (pt[1] - a[1]) * ux) for pt in (p, q)]
+                if max(off_line) > 0.01:
+                    continue
+                tp = (p[0] - a[0]) * ux + (p[1] - a[1]) * uy
+                tq = (q[0] - a[0]) * ux + (q[1] - a[1]) * uy
+                if min(max(tp, tq), length) - max(min(tp, tq), 0.0) > 0.05:
+                    crossing += 1
+        return crossing, b
+
+    def door_between_rooms_opens():
+        if not door:
+            return "skipped: no door in this map's library"
+        if walls_in_the_way():
+            return f"skipped: walls {walls_in_the_way()} already stand where the rooms go"
+        crossing, b = walls_across_the_door("split")
+        assert crossing == 0, f"{crossing} wall segment(s) still cross the doorway: {b}"
+        assert len(b.get("shared_edges", [])) == 1, f"the shared edge was not found: {b}"
+        # The control: the old full loop doubles the wall, and the test sees it.
+        doubled, _ = walls_across_the_door("keep")
+        assert doubled >= 1, "the check cannot see a doubled wall, so it proves nothing"
+        return f"split: doorway clear; keep: {doubled} segment(s) across it"
+
+    u.check(
+        "shared_walls: a door between two rooms has no wall across it in the export",
+        door_between_rooms_opens,
+        needs_dirty=True,
+    )
+
+    # regression: a boundary already walled all round sent wall_runs=[], which
+    # the bridge refused, so the floor was not built either.
+    def walled_boundary_gets_only_a_floor():
+        if not floor:
+            return "skipped: no Simple Tiles floor in this map's library"
+        if walls_in_the_way():
+            return f"skipped: walls {walls_in_the_way()} already stand where the rooms go"
+        server.checkpoint("shared_walls")
+        try:
+            server.build_room(rect=[x0, y0, 3 * T, 3 * T], floor="none", snap="none")
+            walls = u.c.request("list_elements", kind="walls", limit=1)["total"]
+            again = server.build_room(
+                rect=[x0, y0, 3 * T, 3 * T],
+                floor_asset=floor,
+                floor_category="Simple Tiles",
+                snap="none",
+            )
+            after = u.c.request("list_elements", kind="walls", limit=1)["total"]
+            try:
+                server.build_room(rect=[x0, y0, 3 * T, 3 * T], floor="none", snap="none")
+            except ValidationError as exc:
+                refused = "nothing to build" in str(exc)
+            else:
+                refused = False
+        finally:
+            server.rollback_checkpoint("shared_walls")
+        assert again.get("wall_ids") == [], f"walls drawn over the existing loop: {again}"
+        assert again.get("floor_id") is not None, f"no floor built: {again}"
+        assert after == walls, f"wall count went {walls} -> {after}"
+        assert refused, "a walls-only rebuild over existing walls was not refused"
+        return (
+            f"no new wall, floor {again['floor_id']}, {len(again['shared_edges'])} edges "
+            "shared; floor='none' refused"
+        )
+
+    u.check(
+        "shared_walls: a boundary walled all round gets only its floor",
+        walled_boundary_gets_only_a_floor,
+        needs_dirty=True,
+    )
+
+
+@group("floor_tint")
+def floor_tint(u: Uat) -> None:
+    """Runtime behavior and validation."""
+    import importlib
+
+    server = importlib.import_module("battlemap_mcp.server")
+    tile = 256
+    st = u.c.request("get_status")
+    x0, y0 = st["map_size_woxels"][0] - 14 * tile, st["map_size_woxels"][1] - 5 * tile
+
+    def red_masks_are_tinted_like_greyscale():
+        tiles = u.c.request("list_assets", category="Simple Tiles", limit=200)["assets"]
+        masks = [
+            a
+            for a in tiles
+            if a.rsplit("/", 1)[-1]
+            in ("tileset_wood_damaged.png", "tileset_diamond_2.png", "tileset_ornate.png")
+        ]
+        grey = next((a for a in tiles if a.endswith("tileset_wood_interlaced.png")), None)
+        if not masks or not grey:
+            return "skipped: the core Simple Tiles masks are not in this map's library"
+        server.checkpoint("uat_floor_tint")
+        try:
+            seen = {}
+            for i, asset in enumerate([*masks, grey]):
+                rect = [x0 + i * 3 * tile, y0, 2 * tile, 2 * tile]
+                seen[asset.rsplit("/", 1)[-1]] = server.place_pattern(
+                    asset=asset, rect=rect, category="Simple Tiles"
+                )
+            for name, res in seen.items():
+                assert res.get("used_default_tint") is True, (name, res)
+                assert res["color"].lower() != "#ffffffff", (name, res["color"])
+                want_mask = name != "tileset_wood_interlaced.png"
+                assert res.get("texture_red_mask") is want_mask, (name, res)
+                assert res.get("texture_greyscale") is (not want_mask), (name, res)
+            return ", ".join(f"{n} {r['color']}" for n, r in seen.items())
+        finally:
+            server.rollback_checkpoint("uat_floor_tint")
+
+    u.check(
+        "floor tint: red colour masks get the default tint, not white",
+        red_masks_are_tinted_like_greyscale,
+        needs_dirty=True,
+    )
+
+    # The reddest real-colour texture in core (infestation_tile) is the case the
+    # spread threshold exists for: red_share 1.0, but too faint to be a mask.
+    def colour_art_left_alone():
+        found = []
+        server.checkpoint("uat_floor_tint_art")
+        try:
+            for search in ("infestation", "grass"):
+                asset = u.asset("Materials", search)
+                if not asset:
+                    continue
+                name = asset.rsplit("/", 1)[-1]
+                rect = [x0 + 3 * tile * len(found), y0 - 3 * tile, 2 * tile, 2 * tile]
+                r = server.place_pattern(asset=asset, rect=rect, category="Materials")
+                assert r.get("texture_red_mask") is False, f"{name} taken for a mask: {r}"
+                assert r["color"].lower() in ("#ffffff", "#ffffffff"), f"{name} tinted: {r}"
+                found.append(name)
+        finally:
+            server.rollback_checkpoint("uat_floor_tint_art")
+        if not found:
+            return "skipped: no infestation or grass material in this map's library"
+        return f"{', '.join(found)}: real colour, left untinted"
+
+    u.check(
+        "floor tint: full-colour art is left untinted",
+        colour_art_left_alone,
+        needs_dirty=True,
+    )
+
+
 @group("material")
 def material(u: Uat) -> None:
     """A material stroke lands where it was painted and undoes cleanly."""
@@ -3146,6 +3414,57 @@ def packs_and_exports(u: Uat) -> None:
         return f"previewed {len(paths)} from {pack['id']}; placement refused"
 
     u.check("assets: a pack the map lacks previews but does not place", preview_unincluded_pack)
+
+
+@group("trace_image")
+def trace_image(u: Uat) -> None:
+    """The trace image goes where it is put, stays there on a retry, and saves."""
+    import tempfile
+
+    from PIL import Image
+
+    def position_is_set_and_saved():
+        st = u.c.request("get_status")
+        map_file = st.get("map_file")
+        if not map_file:
+            return "skipped: the map has never been saved, so it cannot be reopened"
+        target = [u.cx + 300.0, u.cy - 200.0]
+        with tempfile.TemporaryDirectory() as folder:
+            sketch = pathlib.Path(folder) / "uat-trace.png"
+            Image.new("RGB", (512, 512), (200, 200, 200)).save(sketch)
+            u.c.request("set_trace_image", path=str(sketch), center=True)
+            try:
+                first = u.c.request("set_trace_image", position=target)
+                again = u.c.request("set_trace_image", position=target)
+                assert first["position"] == target, f"placed at {first['position']}"
+                assert again["position"] == target, f"a retry moved it to {again['position']}"
+                centred = u.c.request("set_trace_image", center=True)
+                assert centred["position"] == st["map_center"], centred
+                u.c.request("set_trace_image", position=target)
+                u.c.request("save_map")
+                time.sleep(1.0)
+                assert u.wait_for_save(), "save did not finish"
+                u.c.request("open_map", path=map_file)
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    time.sleep(0.5)
+                    try:
+                        now = u.c.request("get_status")
+                    except Exception:
+                        continue
+                    if now.get("map_open") and now.get("undo_depth") == 0:
+                        break
+                back = u.c.request("set_trace_image", opacity=0.5)
+                assert back["position"] == target, f"reopened at {back['position']}"
+            finally:
+                u.c.request("set_trace_image", clear=True)
+        return f"at {target} after a retry and after save and reopen; center resets it"
+
+    u.check(
+        "trace_image: position is set, safe to repeat, and survives save and reopen",
+        position_is_set_and_saved,
+        needs_dirty=True,
+    )
 
 
 @group("lights")

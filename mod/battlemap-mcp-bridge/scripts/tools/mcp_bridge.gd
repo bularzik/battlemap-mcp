@@ -75,8 +75,13 @@ const DEFAULT_PATTERN_TINT := Color(0.62, 0.5, 0.34)
 const MASK_VISIBLE_RED := 0.25
 
 const MASK_DOMINANT := 0.25
+
+const COLORABLE_DEFAULT_HINT := "If nothing fits better, Dungeondraft's own default is #6b3834."
 var _pack_mask_rules := {}
 const PATTERN_GREYSCALE_SAMPLE_PX := 64
+
+const RED_MASK_MIN_SHARE := 0.9
+const RED_MASK_MIN_SPREAD := 0.4
 var _pattern_greyscale_cache := {}
 
 const WOXELS_PER_TILE := 256
@@ -1593,9 +1598,23 @@ func _set_trace_image(req : Dictionary) -> Dictionary:
 	if bool(req.get("center", false)) and trace.has_method("Center"):
 		trace.Center()
 		applied["centered"] = true
+	# Where the image's centre sits, set rather than nudged, so a retried call
+	# lands in the same place. Dungeondraft saves it with the map.
+	if req.has("position"):
+		var at = req["position"]
+		if typeof(at) != TYPE_ARRAY or at.size() != 2:
+			_release_tool(trace, was_active)
+			return _err("'position' must be [x, y] in woxels")
+		var moved = Global.World.get("TraceImage")
+		if moved == null or not is_instance_valid(moved) or not (moved is Node2D) \
+				or moved.get("texture") == null:
+			_release_tool(trace, was_active)
+			return _err("no trace image to position; load one with path first")
+		moved.position = Vector2(float(at[0]), float(at[1]))
+		applied["positioned"] = true
 	_release_tool(trace, was_active)
 	if applied.empty():
-		return _err("give at least one of path, scale, opacity, center or clear")
+		return _err("give at least one of path, scale, opacity, center, position or clear")
 	# Read back what is drawn, not what was asked: the Sprite, not the flag.
 	var sprite = Global.World.get("TraceImage")
 	var drawn := false
@@ -1604,6 +1623,7 @@ func _set_trace_image(req : Dictionary) -> Dictionary:
 		drawn = sprite.is_visible_in_tree() and sprite.texture != null
 		if sprite.texture != null:
 			size = [sprite.texture.get_width(), sprite.texture.get_height()]
+			applied["position"] = _vec(sprite.position)
 	applied["visible"] = drawn
 	applied["image_size"] = size
 	return _ok(applied)
@@ -2218,6 +2238,7 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		"generator_options": return _generator_options(req)
 		"delete_level": return _delete_level(req)
 		"set_map_size": return _set_map_size(req)
+		"set_grid": return _set_grid(req)
 		"get_cave": return _get_cave(req)
 		"set_cave_entrance": return _set_cave_entrance(req)
 		"dig_cave": return _dig_cave(req)
@@ -2657,25 +2678,48 @@ func _preview_size(category : String, tex) -> Vector2:
 # full-colour pack art. Only a mask wants tinting: multiplying a coloured wall
 # would misrepresent the very thing the preview exists to show.
 func _is_greyscale(img : Image) -> bool:
+	return _greyscale_from(_colour_stats(img))
+
+func _colour_stats(img : Image) -> Dictionary:
 	img.lock()
 	var opaque := 0
 	var coloured := 0
+	var red := 0
+	var spread_sum := 0.0
 	for y in range(0, img.get_height(), 2):
 		for x in range(0, img.get_width(), 2):
 			var c = img.get_pixel(x, y)
 			if c.a < 0.5:
 				continue
 			opaque += 1
-			if max(abs(c.r - c.g), max(abs(c.g - c.b), abs(c.r - c.b))) > 0.08:
+			var spread = max(abs(c.r - c.g), max(abs(c.g - c.b), abs(c.r - c.b)))
+			if spread > 0.08:
 				coloured += 1
+				spread_sum += spread
+				if c.r - max(c.g, c.b) > 0.08 and abs(c.g - c.b) <= 0.08:
+					red += 1
 	img.unlock()
-	return opaque > 0 and coloured <= opaque / 50
+	return { "opaque": opaque, "coloured": coloured,
+		"coloured_share": float(coloured) / float(opaque) if opaque > 0 else 0.0,
+		"mean_spread": spread_sum / float(coloured) if coloured > 0 else 0.0,
+		"red_share": float(red) / float(coloured) if coloured > 0 else 0.0 }
+
+func _greyscale_from(stats : Dictionary) -> bool:
+	return int(stats["opaque"]) > 0 and int(stats["coloured"]) <= int(stats["opaque"]) / 50
+
+func _red_mask_from(stats : Dictionary) -> bool:
+	return (int(stats["coloured"]) > 0 and float(stats["red_share"]) >= RED_MASK_MIN_SHARE
+		and float(stats["mean_spread"]) >= RED_MASK_MIN_SPREAD)
 
 func _texture_is_greyscale(tex) -> bool:
+	return _greyscale_from(_texture_colour_stats(tex))
+
+func _texture_colour_stats(tex) -> Dictionary:
 	var key = str(tex.resource_path)
 	if key != "" and _pattern_greyscale_cache.has(key):
 		return _pattern_greyscale_cache[key]
-	var answer := false
+	var stats := { "opaque": 0, "coloured": 0, "coloured_share": 0.0, "mean_spread": 0.0,
+		"red_share": 0.0 }
 	var img = tex.get_data()
 	if img != null:
 		img = img.duplicate()
@@ -2684,10 +2728,10 @@ func _texture_is_greyscale(tex) -> bool:
 		img.convert(Image.FORMAT_RGBA8)
 		if img.get_width() > 0 and img.get_height() > 0:
 			img.resize(PATTERN_GREYSCALE_SAMPLE_PX, PATTERN_GREYSCALE_SAMPLE_PX, Image.INTERPOLATE_BILINEAR)
-			answer = _is_greyscale(img)
+			stats = _colour_stats(img)
 	if key != "":
-		_pattern_greyscale_cache[key] = answer
-	return answer
+		_pattern_greyscale_cache[key] = stats
+	return stats
 
 # Multiply an image by a colour, keeping alpha — what the tile tools do at
 # placement, applied to a preview-sized copy. Runs after the resize, so it
@@ -3966,7 +4010,8 @@ func _place_one_object(req : Dictionary) -> Dictionary:
 		if mask >= MASK_DOMINANT:
 			out["note"] = ("this asset has an unpainted colour mask and will render " +
 				"flat RED. Colour is baked at placement, so re-place it with " +
-				"color=\"#rrggbb\" — modify_object cannot repaint it.")
+				"color=\"#rrggbb\" — modify_object cannot repaint it. " +
+				COLORABLE_DEFAULT_HINT)
 		else:
 			out["note"] = ("%d%% of this asset is a colour mask, which shows red " +
 				"untinted. Look before replacing it: colour is baked at placement.") \
@@ -4058,7 +4103,7 @@ func _place_objects(req : Dictionary) -> Dictionary:
 	if not colorable.empty():
 		out_note = ("ids %s were placed from colourable assets with no color= and " +
 			"render flat RED. Colour is baked at placement: delete them and place " +
-			"again with color=\"#rrggbb\".") % str(colorable)
+			"again with color=\"#rrggbb\". %s") % [str(colorable), COLORABLE_DEFAULT_HINT]
 
 	var partial_note = ""
 	if not partial.empty():
@@ -4073,8 +4118,9 @@ func _place_objects(req : Dictionary) -> Dictionary:
 		if not colorable.empty():
 			out_note = ("%d object(s) were placed from colourable assets with no " +
 				"color= and render flat RED (ids %s%s). Colour is baked at " +
-				"placement: delete them and place again with color=\"#rrggbb\".") \
-				% [colorable.size(), str(shown), " ..." if colorable.size() > 20 else ""]
+				"placement: delete them and place again with color=\"#rrggbb\". %s") \
+				% [colorable.size(), str(shown), " ..." if colorable.size() > 20 else "",
+					COLORABLE_DEFAULT_HINT]
 		return _ok({ "placed": placed.size(), "id_ranges": _id_ranges(_ids_of(placed)),
 			"colorable_without_color": colorable.size(), "undoable": true,
 			"note": (out_note + " " + partial_note).strip_edges() })
@@ -4440,11 +4486,15 @@ func _place_pattern(req : Dictionary) -> Dictionary:
 	var color
 	var used_default = false
 	var greyscale = null
+	var red_mask = null
+	var texture_colour = null
 	if req.has("color") and str(req.get("color", "")) != "":
 		color = _color(req["color"], DEFAULT_PATTERN_TINT)
 	else:
-		greyscale = _texture_is_greyscale(tex)
-		color = DEFAULT_PATTERN_TINT if greyscale else Color(1, 1, 1)
+		texture_colour = _texture_colour_stats(tex)
+		greyscale = _greyscale_from(texture_colour)
+		red_mask = _red_mask_from(texture_colour)
+		color = DEFAULT_PATTERN_TINT if greyscale or red_mask else Color(1, 1, 1)
 		used_default = true
 	if color.a < 0.05:
 		color = Color(color.r, color.g, color.b, 1.0)
@@ -4481,6 +4531,10 @@ func _place_pattern(req : Dictionary) -> Dictionary:
 		# patterns; pass an explicit `color` for an exact look).
 		result["used_default_tint"] = true
 		result["texture_greyscale"] = greyscale
+		result["texture_red_mask"] = red_mask
+		result["texture_colour"] = { "coloured_share": stepify(texture_colour["coloured_share"], 0.0001),
+			"mean_spread": stepify(texture_colour["mean_spread"], 0.0001),
+			"red_share": stepify(texture_colour["red_share"], 0.0001) }
 	# Enumeration is grouped by layer; the new shape need not be last.
 	for shape in all:
 		if existing_shapes.has(shape.get_instance_id()):
@@ -4702,18 +4756,18 @@ func _object_reach(asset : String) -> float:
 	return max(max(centre.distance_to(lo), centre.distance_to(hi)),
 		max(centre.distance_to(Vector2(lo.x, hi.y)), centre.distance_to(Vector2(hi.x, lo.y))))
 
-func _room_rollback(wall_id, floor_error) -> Dictionary:
-	var removed = false
-	if wall_id != null:
-		var del = _delete_element({ "id": int(wall_id) })
-		removed = del.get("ok", false)
-	if removed:
-		return _err(("the room's floor could not be created (%s), so the room was not " +
-			"built and the wall drawn for it has been removed. Nothing remains on the map.")
+func _room_rollback(wall_ids : Array, floor_error) -> Dictionary:
+	var left := []
+	for wall_id in wall_ids:
+		if wall_id == null or not _delete_element({ "id": int(wall_id) }).get("ok", false):
+			left.append(str(wall_id))
+	if left.empty():
+		return _err(("the room could not be completed (%s), so it was not " +
+			"built and the walls drawn for it have been removed. Nothing remains on the map.")
 			% str(floor_error))
-	return _err(("the room's floor could not be created (%s), and the wall drawn for it " +
-		"(id %s) could NOT be removed. Delete that wall before retrying, or the retry " +
-		"will leave two walls on top of each other.") % [str(floor_error), str(wall_id)])
+	return _err(("the room could not be completed (%s), and the walls drawn for it " +
+		"(ids %s) could NOT be removed. Delete them before retrying, or the retry " +
+		"will leave two walls on top of each other.") % [str(floor_error), ", ".join(left)])
 
 func _build_room(req : Dictionary) -> Dictionary:
 	var level = Global.World.GetCurrentLevel()
@@ -4750,19 +4804,40 @@ func _build_room(req : Dictionary) -> Dictionary:
 				"asset, so NOTHING was created. Choose one from " +
 				"list_assets(category='Terrain').") % str(req.get("floor_asset", "")))
 
-	var result := {}
+	# wall_runs: the server found part of this boundary already walled (a
+	# neighbouring room), so draw only the uncovered runs, each an open wall.
+	# An empty list means the whole boundary is walled: draw the floor alone.
+	var has_runs := req.has("wall_runs")
+	var runs := []
+	if has_runs:
+		runs = req["wall_runs"]
+		if typeof(runs) != TYPE_ARRAY:
+			return _err("'wall_runs' must be a list of point lists")
+		for run in runs:
+			if typeof(run) != TYPE_ARRAY or run.size() < 2:
+				return _err("each of 'wall_runs' needs >= 2 [x,y] pairs")
 
-	# 1) Wall loop along the boundary.
-	var wall_req := {
-		"points": pts_raw, "loop": true,
-		"asset": req.get("wall_asset", ""),
-		"type": req.get("wall_type", 0), "joint": req.get("wall_joint", 1),
-		"shadow": req.get("wall_shadow", true),
-	}
-	var wall_res = _draw_wall(wall_req)
-	if not wall_res.get("ok", false):
-		return wall_res
-	result["wall_id"] = wall_res["result"].get("id")
+	var result := {}
+	var drawn := []
+
+	# 1) Walls along the boundary: one loop, or the given open runs.
+	var paths := runs if has_runs else [pts_raw]
+	for path in paths:
+		var wall_res = _draw_wall({
+			"points": path, "loop": not has_runs,
+			"asset": req.get("wall_asset", ""),
+			"type": req.get("wall_type", 0), "joint": req.get("wall_joint", 1),
+			"shadow": req.get("wall_shadow", true),
+		})
+		if not wall_res.get("ok", false):
+			if drawn.empty():
+				return wall_res
+			return _room_rollback(drawn, wall_res.get("error"))
+		drawn.append(wall_res["result"].get("id"))
+	if has_runs:
+		result["wall_ids"] = drawn
+	else:
+		result["wall_id"] = drawn[0]
 
 	# 2) Floor along the SAME boundary (no inset — the wall covers the seam).
 	var floor_kind = str(req.get("floor", "pattern"))
@@ -4778,7 +4853,7 @@ func _build_room(req : Dictionary) -> Dictionary:
 		if fres.get("ok", false):
 			result["floor_id"] = fres["result"].get("id")
 		else:
-			return _room_rollback(result.get("wall_id"), fres.get("error"))
+			return _room_rollback(drawn, fres.get("error"))
 	elif floor_kind == "terrain":
 		var tr := {
 			"points": pts_raw, "slot": int(req.get("floor_slot", 1)),
@@ -4789,7 +4864,7 @@ func _build_room(req : Dictionary) -> Dictionary:
 		if tres.get("ok", false):
 			result["floor_pixels"] = tres["result"].get("pixels")
 		else:
-			return _room_rollback(result.get("wall_id"), tres.get("error"))
+			return _room_rollback(drawn, tres.get("error"))
 	# floor_kind == "none" -> walls only
 
 	result["points"] = pts_raw
@@ -5685,6 +5760,29 @@ func _forget_history() -> bool:
 	_discard_redo()
 	return true
 
+func _set_grid(req : Dictionary) -> Dictionary:
+	if not req.has("visible") or typeof(req["visible"]) != TYPE_BOOL:
+		return _err("visible must be true or false")
+	if Global.World == null or Global.World.GetCurrentLevel() == null:
+		return _err("no map open")
+	var grid_mesh = Global.World.get("GridMesh")
+	if grid_mesh == null:
+		return _err("this map has no grid mesh to show or hide")
+
+	var toggle = Global.Editor.get("GridToggle")
+	if toggle == null or not (toggle is BaseButton) or not Global.Editor.has_method("ToggleGrid"):
+		return _err("this build exposes no Editor.GridToggle/ToggleGrid to drive")
+	var want = bool(req["visible"])
+	toggle.pressed = want
+	# pressed emits toggled only on a change; if the grid already disagreed
+	# with the checkbox, bring it into line through the editor too.
+	if grid_mesh.visible != want:
+		Global.Editor.ToggleGrid(want)
+	if toggle.pressed != grid_mesh.visible:
+		return _err("the grid shows %s but the View menu's checkbox says %s"
+			% [str(grid_mesh.visible), str(toggle.pressed)])
+	return _ok({ "grid_visible": grid_mesh.visible, "grid_toggle": toggle.pressed })
+
 func _set_map_size(req : Dictionary) -> Dictionary:
 	if not req.has("width") or not req.has("height"):
 		return _err("'width' and 'height' are required, in tiles")
@@ -6409,6 +6507,11 @@ func _describe(node, want_points : bool = true, want_opaque : bool = false) -> D
 	var loop = node.get("Loop")
 	if loop != null:
 		d["loop"] = bool(loop)
+	# 0=auto, 1=manual, 2=cave: build_room shares a wall only with its own type.
+	if d.get("kind") == "wall":
+		var wall_type = node.get("Type")
+		if wall_type != null:
+			d["wall_type"] = int(wall_type)
 
 	if want_points:
 		var pts = node.get("Points")

@@ -636,6 +636,19 @@ def main() -> int:
         check("set_trace_image", lambda: bridge.request("set_trace_image", opacity=0.5))
         bridge.request("set_trace_image", clear=True)
 
+        # Editor grid: hide it, show it again, and read it back from the style.
+        def grid_round_trip():
+            shown = bool(bridge.request("get_map_style").get("grid_visible", True))
+            hidden = bridge.request("set_grid", visible=not shown)["grid_visible"]
+            back = bridge.request("set_grid", visible=shown)["grid_visible"]
+            if hidden == shown or back != shown:
+                raise BridgeCommandError(
+                    f"{shown} -> {hidden} -> {back}", cmd="set_grid", params={}
+                )
+            return f"{shown} -> {hidden} -> restored"
+
+        check("set_grid", grid_round_trip)
+
         material_asset = first_asset("Materials")
         if material_asset:
             check(
