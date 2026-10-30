@@ -955,18 +955,18 @@ def test_failed_legacy_restoration_retains_state_backup(monkeypatch, tmp_path):
     legacy = plan.destination.with_name(plan.destination.name + ".backup-old")
     legacy.mkdir()
     (legacy / "local.txt").write_text("legacy")
-    copytree = installer.copytree
+    restore = installer._restore_changed
 
     def fail_record(*args):
         raise OSError("record failure")
 
-    def fail_restore(source, destination, *args, **kwargs):
-        if destination == legacy:
+    def fail_restore(backup, original):
+        if original == legacy:
             raise OSError("restore failure")
-        return copytree(source, destination, *args, **kwargs)
+        return restore(backup, original)
 
     monkeypatch.setattr(installer, "_record_install", fail_record)
-    monkeypatch.setattr(installer, "copytree", fail_restore)
+    monkeypatch.setattr(installer, "_restore_changed", fail_restore)
     with pytest.raises(OSError, match="restore failure"):
         installer.apply_install(plan, force=True)
     copies = list((plan.records_path.parent / "backups").rglob("local.txt"))

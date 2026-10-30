@@ -4,6 +4,50 @@ What changed in each release, written for the people using it. Versions cover
 the companion, the Dungeondraft mod and the map-making skills together; the
 wire protocol between them is versioned separately and is currently 25.
 
+## 1.4.1 — 2026-10-30
+
+Rooms built side by side share one wall, so their doors open in your VTT,
+and a few smaller fixes. Most of this release is @bularzik's work, from
+five pull requests: thank you, Dan.
+
+**Doors between rooms open in your VTT.** Two rooms built next to each
+other used to get two walls on the edge they share. A door mounts on one of
+them, so in Foundry or Roll20 the other still blocked the doorway. Now the
+second room uses the wall that is already there and draws only its free
+sides, so the door opens. A room drawn inside walls that already surround
+it gets just its floor. Only a wall of the same kind is shared, so a cave
+wall is never borrowed for a stone room.
+
+**Tiled floors drawn as colour masks come out brown, not white.** Simple
+Tiles such as damaged wood, diamonds and the ornate tile are drawn as red
+masks meant to be tinted. Placed without a colour they rendered white; they
+now get the same neutral brown as other plain floors. Floors with colours
+of their own are left as they are.
+
+**Line up a traced sketch with the grid.** Your assistant can now put a
+reference image exactly where it should sit, so a hand-drawn plan's squares
+match the map's. Asking twice puts it in the same place, and the position
+is saved with the map.
+
+**Hide the grid in the editor.** Your assistant can show or hide the grid,
+for example to take a clean screenshot. It works the View menu's own Grid
+checkbox, so the menu always matches what you see. It isn't saved: the grid
+is back when you reopen the map.
+
+**A colour suggestion for unpainted objects.** When an object is placed
+without a colour and shows as a flat red shape, your assistant is now told
+Dungeondraft's own default colour as a fallback, while still choosing one
+that suits the object.
+
+**Moving an old bridge copy out of Program Files explains itself.** If a
+copy sits in a folder only an administrator can change, the installer now
+says so before touching anything, instead of failing part-way with an
+error that read like a bug.
+
+**The Battlemap MCP Bridge panel's note is accurate.** It said your assistant could
+not change any of the panel's settings, but it can switch Verbose log for
+troubleshooting. The note now says which settings are yours alone.
+
 ## 1.4.0 — 2026-10-20
 
 Furnish a room in one step, keep scattered art off walls, place lights with

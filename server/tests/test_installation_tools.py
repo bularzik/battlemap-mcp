@@ -206,3 +206,94 @@ def test_a_failed_install_puts_moved_copies_back(monkeypatch, tmp_path):
     assert (old / "fork-marker.txt").read_text() == "old-bridge"
     assert not (mods_dir / "battlemap-mcp-bridge").exists()
     assert not any(installer._state_backups_dir(plan).glob("old-bridge.backup-*"))
+
+
+def test_a_protected_bridge_copy_is_refused_before_anything_moves(monkeypatch, tmp_path):
+    """Runtime behavior and validation."""
+    import pytest
+
+    from battlemap_mcp import installer
+
+    mods_dir = tmp_path / "mods"
+    old = _fork_copy(mods_dir, "protected-bridge")
+    plan = installer.plan_install(
+        mods_dir, datetime(2026, 10, 30, tzinfo=UTC), state_dir=tmp_path / "state"
+    )
+    monkeypatch.setattr(installer, "_can_remove", lambda path: path != old)
+    with pytest.raises(installer.InstallConflictError, match="administrator"):
+        installer.apply_install(plan, force=False, move_other_copies=True)
+    assert (old / "fork-marker.txt").read_text() == "protected-bridge"
+    assert not (mods_dir / "battlemap-mcp-bridge").exists()
+    assert not installer._state_backups_dir(plan).exists()
+
+
+def test_a_removable_folder_passes_the_probe_and_keeps_no_probe_file(tmp_path):
+    from battlemap_mcp import installer
+
+    copy = _fork_copy(tmp_path / "mods", "plain")
+    assert installer._can_remove(copy) is True
+    for folder in (copy, copy.parent):
+        assert not any(p.name.startswith(".battlemap-mcp-probe-") for p in folder.iterdir())
+
+
+def test_a_refused_probe_returns_at_once(monkeypatch, tmp_path):
+    """Runtime behavior and validation."""
+    import os
+
+    from battlemap_mcp import installer
+
+    copy = _fork_copy(tmp_path / "mods", "plain")
+    calls = []
+
+    def refuse(path, *args, **kwargs):
+        calls.append(path)
+        if len(calls) > 1:
+            raise AssertionError(f"probe retried: {calls}")
+        raise PermissionError(13, "Access is denied", str(path))
+
+    monkeypatch.setattr(os, "access", lambda *a, **k: True)
+    monkeypatch.setattr(os, "open", refuse)
+    assert installer._can_remove(copy) is False
+    assert len(calls) == 1
+
+
+def test_a_restore_rewrites_only_missing_or_changed_files(monkeypatch, tmp_path):
+    """Writing over an untouched file in a protected folder raised Permission
+    denied; a restore now leaves files that still match alone."""
+    from battlemap_mcp import installer
+
+    backup = tmp_path / "backup"
+    original = tmp_path / "original"
+    for root in (backup, original):
+        (root / "sub").mkdir(parents=True)
+        (root / "same.txt").write_text("same")
+    (backup / "gone.txt").write_text("restore me")
+    (backup / "sub" / "changed.txt").write_text("right")
+    (original / "sub" / "changed.txt").write_text("wrong")
+    written = []
+
+    def copy2(source, target):
+        written.append(target.relative_to(original).as_posix())
+        target.write_bytes(source.read_bytes())
+
+    monkeypatch.setattr(installer, "copy2", copy2)
+    installer._restore_changed(backup, original)
+    assert sorted(written) == ["gone.txt", "sub/changed.txt"]
+    assert (original / "gone.txt").read_text() == "restore me"
+    assert (original / "sub" / "changed.txt").read_text() == "right"
+
+
+def test_two_installs_in_one_second_get_separate_backups(tmp_path):
+    """Runtime behavior and validation."""
+    from battlemap_mcp import installer
+
+    mods_dir = tmp_path / "mods"
+    old = _fork_copy(mods_dir, "twice")
+    plan = installer.plan_install(
+        mods_dir, datetime(2026, 10, 30, tzinfo=UTC), state_dir=tmp_path / "state"
+    )
+    ((_, first),) = installer.other_copy_backups(plan)
+    first.mkdir(parents=True)
+    ((_, second),) = installer.other_copy_backups(plan)
+    assert second == first.with_name(first.name + "-2")
+    assert old.exists()

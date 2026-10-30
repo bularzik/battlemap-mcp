@@ -258,6 +258,22 @@ class Uat:
             time.sleep(0.2)
         return False
 
+    # A reopen logs `Parameter "ptr" is null` from the engine some seconds
+    # after the bridge answers again, so a case that returned as soon as
+    # get_status came back had those lines charged to the NEXT case. Wait as
+    # long as the save round-trip case always has, inside the case that opened.
+    def reopen(self, path: str, settle: float = 16.0) -> None:
+        self.c.request("open_map", path=path)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            time.sleep(0.5)
+            try:
+                if self.c.request("get_status").get("undo_depth") == 0:
+                    break
+            except Exception:
+                continue
+        time.sleep(settle)
+
     def made_file(self, path: str) -> str:
         """Record a map file this run created, for cleanup in report()."""
         self.made_files.append(path)

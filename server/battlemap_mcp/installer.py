@@ -6,13 +6,14 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import sys
 import tempfile
 from dataclasses import dataclass, replace
 from datetime import datetime
 from importlib import resources
 from pathlib import Path
-from shutil import copytree, move, rmtree
+from shutil import copy2, copytree, move, rmtree
 from typing import Any
 
 from .bridge_client import PROTOCOL_VERSION, BridgeClient
@@ -459,9 +460,48 @@ def plan_install(mods_dir: Path, now: datetime, *, state_dir: Path) -> InstallPl
 def other_copy_backups(plan: InstallPlan) -> tuple[tuple[Path, Path], ...]:
     """Runtime behavior and validation."""
     return tuple(
-        (path, _state_backups_dir(plan) / f"{path.name}.backup-{_stamp(plan)}")
+        (path, _free_path(_state_backups_dir(plan) / f"{path.name}.backup-{_stamp(plan)}"))
         for path in plan.other_copies
     )
+
+
+def _free_path(path: Path) -> Path:
+    """Runtime behavior and validation."""
+    candidate, n = path, 2
+    while candidate.exists():
+        candidate = path.with_name(f"{path.name}-{n}")
+        n += 1
+    return candidate
+
+
+def _can_remove(path: Path) -> bool:
+    """Runtime behavior and validation."""
+    for folder in (path.parent, path):
+        probe = folder / f".battlemap-mcp-probe-{secrets.token_hex(8)}"
+        try:
+            handle = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except OSError:
+            return False
+        os.close(handle)
+        try:
+            os.unlink(probe)
+        except OSError:
+            return False
+    return True
+
+
+def _restore_changed(backup: Path, original: Path) -> None:
+    """Runtime behavior and validation."""
+    for source in sorted(backup.rglob("*")):
+        target = original / source.relative_to(backup)
+        if source.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        elif not target.is_file() or (
+            hashlib.sha256(target.read_bytes()).digest()
+            != hashlib.sha256(source.read_bytes()).digest()
+        ):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            copy2(source, target)
 
 
 def _state_backups_dir(plan: InstallPlan) -> Path:
@@ -505,19 +545,23 @@ def apply_install(
             + ", ".join(links)
             + ". Remove the link itself by hand; the folder it points to is not affected."
         )
-    for _, backup in moved:
-        if backup.exists():
-            raise InstallConflictError(f"Backup already exists: {backup}")
+    protected = [str(original) for original, _ in moved if not _can_remove(original)]
+    if protected:
+        raise InstallConflictError(
+            "These bridge copies are in a folder this account cannot change, such as "
+            "Program Files: " + ", ".join(protected) + ". Moving them needs an "
+            "administrator: delete or move them by hand from an administrator "
+            "prompt, or install without move_other_copies. Nothing was changed."
+        )
 
     if plan.destination.exists():
         if not force:
             raise InstallConflictError("Existing bridge requires --force to replace")
 
-        backup_destination = state_backups_dir / (
-            f"{plan.destination.name}.backup-{plan.now.strftime('%Y%m%dT%H%M%SZ')}"
+        backup_destination = _free_path(
+            state_backups_dir
+            / f"{plan.destination.name}.backup-{plan.now.strftime('%Y%m%dT%H%M%SZ')}"
         )
-        if backup_destination.exists():
-            raise InstallConflictError(f"Backup already exists: {backup_destination}")
 
     # Stage outside mod discovery before moving any existing installation.
     plan.records_path.parent.mkdir(parents=True, exist_ok=True)
@@ -573,9 +617,9 @@ def apply_install(
                 rmtree(plan.destination)
             if destination_removal_started and backup_destination is not None:
                 if installed or not destination_removed or not plan.destination.exists():
-                    copytree(backup_destination, plan.destination, dirs_exist_ok=True)
+                    _restore_changed(backup_destination, plan.destination)
             for original, backup in reversed(restoring):
-                copytree(backup, original, dirs_exist_ok=True)
+                _restore_changed(backup, original)
             # Include prepared legacy copies whose removal was never reached.
             # A failed restore above leaves every recovery copy intact.
             for original, backup in reversed(owned_backups):

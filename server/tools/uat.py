@@ -1298,15 +1298,7 @@ def colour(u: Uat) -> None:
         u.c.request("save_map")
         time.sleep(1.0)
         assert u.wait_for_save(), "save did not finish"
-        u.c.request("open_map", path=map_file)
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            time.sleep(0.5)
-            try:
-                if u.c.request("get_status").get("undo_depth") == 0:
-                    break
-            except Exception:
-                continue
+        u.reopen(map_file)
         # Ids are not kept across a reopen: find the object where it was put.
         listed = u.c.request("list_elements", kind="objects", limit=500)["elements"]
         # A disposable map may hold copies from earlier runs at the same spot.
@@ -3444,20 +3436,18 @@ def trace_image(u: Uat) -> None:
                 u.c.request("save_map")
                 time.sleep(1.0)
                 assert u.wait_for_save(), "save did not finish"
-                u.c.request("open_map", path=map_file)
-                deadline = time.monotonic() + 30
-                while time.monotonic() < deadline:
-                    time.sleep(0.5)
-                    try:
-                        now = u.c.request("get_status")
-                    except Exception:
-                        continue
-                    if now.get("map_open") and now.get("undo_depth") == 0:
-                        break
+                u.reopen(map_file)
                 back = u.c.request("set_trace_image", opacity=0.5)
                 assert back["position"] == target, f"reopened at {back['position']}"
             finally:
+                # Save the cleared state too. Left saved with a trace whose temp
+                # file is gone, the map's next load of a trace logged
+                # `Parameter "p_child" is null` as the engine removed the
+                # missing one, failing the capture group on the next run.
                 u.c.request("set_trace_image", clear=True)
+                u.c.request("save_map")
+                time.sleep(1.0)
+                u.wait_for_save()
         return f"at {target} after a retry and after save and reopen; center resets it"
 
     u.check(

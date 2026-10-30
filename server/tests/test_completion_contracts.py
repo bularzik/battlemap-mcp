@@ -157,7 +157,7 @@ def test_open_map_waits_for_the_requested_map_not_merely_for_map_open(bridge, fa
     assert result["map_size_woxels"] == [8960, 5120]
 
 
-def test_open_map_survives_the_bridge_restarting_under_it(bridge, fast_clock):
+def test_open_map_survives_the_bridge_restarting_under_it(bridge, fast_clock, monkeypatch):
     """Mods load after the map, so the bridge goes away and comes back."""
     calls = itertools.count()
 
@@ -169,11 +169,11 @@ def test_open_map_survives_the_bridge_restarting_under_it(bridge, fast_clock):
         return {"map_open": True, "map_file": SAVED, "level_id": 0}
 
     bridge.script["open_map"] = [{"opening": True}]
-    object.__setattr__(server.bridge, "request", request)
-    try:
-        assert server.open_map(SAVED)["opened"] is True
-    finally:
-        object.__delattr__(server.bridge, "request")
+    # Through monkeypatch, which the bridge fixture already used on this
+    # attribute: deleting it by hand left pytest 9.2's undo nothing to delete,
+    # and the teardown raised AttributeError.
+    monkeypatch.setattr(server.bridge, "request", request)
+    assert server.open_map(SAVED)["opened"] is True
 
 
 def test_open_map_that_never_arrives_says_so_without_reopening(bridge, fast_clock):

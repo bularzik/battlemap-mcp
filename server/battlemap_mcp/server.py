@@ -2100,6 +2100,14 @@ def place_object(
 ) -> dict:
     """Place an object (prop) on the current map. Returns the new element id.
 
+    If you place a colourable asset WITHOUT a colour, the response comes back
+    with `colorable: true` and `mask_fraction`, and its note says whether the
+    object is a flat red shape or just has red accents.
+    Colour is baked at placement, so the fix is to delete it and place it
+    again with `color`. Choose one that suits the object (a blue banner, a
+    green tablecloth); if nothing fits better, Dungeondraft's own default is
+    #6b3834.
+
     asset: an Objects asset path from list_assets(category='Objects').
     x, y: woxel coordinates; defaults to map center. rotation: degrees.
     sorting: 0=over, 1=under. snap: 'none', 'grid' or 'auto'; see get_snap_settings.
@@ -2201,10 +2209,17 @@ def place_objects(
     never holds a half-finished batch whose ids you were not told.
 
     file: an absolute path to a JSON file of the same entries (a list, or
-      {\"objects\": [...]}), up to 1000. Use it when a script computed the
+      {"objects": [...]}), up to 1000. Use it when a script computed the
       positions: write the file and pass its path instead of copying hundreds
       of entries into the call. The reply is compact: `placed`, `id_ranges`
       ([first, last] runs of ids) and `colorable_without_color`.
+
+    Returns `objects`: one {id, position, layer} per entry, in the order you
+    passed them (with `light_id` for an entry that has a `light`), plus `ids`.
+    Entries placed from a colourable asset with no color are listed in the
+    note: those are flat red, and colour cannot be added afterwards. Give each
+    one a color that suits it; if nothing fits better, Dungeondraft's own
+    default is #6b3834.
 
     One undo() reverses the whole batch while it is the latest operation.
     snap applies to every entry with an x and y; see get_snap_settings.
@@ -2954,10 +2969,10 @@ def build_room(
       existing wall on this level already covers, so two rooms side by side
       share ONE wall and a door placed on it opens in a VTT export. Only a
       wall of the same wall_type (and of wall_asset, when given) is shared.
-      A boundary walled all round gets no wall, only its floor; with
-      floor='none' that is refused. The shared wall belongs to the room
-      built first: deleting that room's wall later leaves this room open on
-      the shared side. 'keep' always draws the full loop.
+      A boundary walled all round gets only its floor (refused with
+      floor='none'). The shared wall belongs to the room built first:
+      deleting it later leaves this room open on that side. 'keep' always
+      draws the full loop.
 
     Returns { wall_id, floor_id?, points }, or, when walls were shared,
     { wall_ids, shared_edges, floor_id?, points } (wall_ids may be empty).
@@ -3856,6 +3871,13 @@ def set_water_style(
 
     Geometry first (add_water), then this. A muddy river, a clear shallow, a
     peat swamp and a deep cold pool are the same mesh with different colour.
+
+    deep_color / shallow_color: hex, e.g. '#12304f'. Deep is the body, shallow
+      is the edge; the gap between them is most of the character.
+    blend_distance: how far the shallow colour reaches in from the shoreline.
+      Small is an abrupt drop-off, large is a gradual wade.
+    border: draw the shoreline border. Off suits a swamp or a flooded floor
+      where the edge should be indefinite.
 
     Per LEVEL: every body of water on this level is restyled, and water drawn
     later on a level whose bodies share one style takes that style too. The

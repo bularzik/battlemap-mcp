@@ -7686,8 +7686,11 @@ func _register_tool():
 	if folder != null:
 		folder.connect("pressed", self, "_on_panel_open_output")
 	_panel_label(panel, "output", "")
-	panel.CreateNote("These settings belong to you. Your assistant can read " +
-		"them but cannot change them.")
+
+	panel.CreateNote("Pause, updates, placements and captures belong to you: " +
+		"your assistant can read them but cannot change them. Verbose log is " +
+		"for troubleshooting, either of you can switch it, and it lasts until " +
+		"Dungeondraft closes.")
 	_refresh_panel()
 
 func _panel_icon() -> String:

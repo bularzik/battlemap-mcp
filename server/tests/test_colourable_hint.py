@@ -1,4 +1,10 @@
-"""Colourable objects: name Dungeondraft's default colour, but never apply it unasked."""
+"""Colourable objects: name Dungeondraft's default colour, but never apply it unasked.
+
+Applying #6b3834 to every uncoloured colourable placement logged an
+ArgumentNullException per object (and measured twice as slow for 100 on
+Windows, though not on macOS), and it took away the model's cue to choose a
+fitting colour.
+"""
 
 from __future__ import annotations
 
